@@ -1,0 +1,38 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "5011:5001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./backend/data:/app/data
+    restart: always
+    networks:
+      - coolify
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.kpanel-backend.rule=Host(`kpanel.kishorlab.dev`) && PathPrefix(`/api`)
+      - traefik.http.routers.kpanel-backend.entrypoints=http,https
+      - traefik.http.routers.kpanel-backend.tls.certresolver=letsencrypt
+      - traefik.http.services.kpanel-backend.loadbalancer.server.port=5001
+  frontend:
+    build: ./frontend
+    ports:
+      - "3005:3000"
+    restart: always
+    networks:
+      - coolify
+    environment:
+      - BACKEND_URL=http://backend:5001
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.kpanel-frontend.rule=Host(`kpanel.kishorlab.dev`)
+      - traefik.http.routers.kpanel-frontend.entrypoints=http,https
+      - traefik.http.routers.kpanel-frontend.tls.certresolver=letsencrypt
+      - traefik.http.services.kpanel-frontend.loadbalancer.server.port=3000
+
+networks:
+  coolify:
+    external: true
