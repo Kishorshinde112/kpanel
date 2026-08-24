@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    expose:
+      - "5001"
+    environment:
+      - PORT=5001
+    volumes:
+      - ./backend/data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      - BACKEND_URL=http://backend:5001
+    depends_on:
+      - backend
