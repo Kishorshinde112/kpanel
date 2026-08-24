@@ -9,7 +9,11 @@ import {
   Database,
   TerminalSquare,
   Activity,
-  Settings
+  Settings,
+  FolderOpen,
+  Terminal,
+  Clock,
+  ArchiveRestore
 } from 'lucide-react';
 import { NavItem } from '../../types';
 import { cn } from '../../lib/utils';
@@ -17,14 +21,18 @@ import { usePathname } from 'next/navigation';
 
 const navItems: NavItem[] = [
   { name: 'Dashboard', href: '/', icon: <LayoutDashboard className="w-5 h-5" /> },
-  { name: 'Applications', href: '#apps', icon: <Box className="w-5 h-5" /> },
-  { name: 'Containers', href: '#containers', icon: <Container className="w-5 h-5" /> },
-  { name: 'Domains', href: '#domains', icon: <Globe className="w-5 h-5" /> },
-  { name: 'SSL Certificates', href: '#ssl', icon: <ShieldCheck className="w-5 h-5" /> },
-  { name: 'Databases', href: '#databases', icon: <Database className="w-5 h-5" /> },
-  { name: 'Environment Variables', href: '#env', icon: <TerminalSquare className="w-5 h-5" /> },
-  { name: 'Monitoring', href: '#monitoring', icon: <Activity className="w-5 h-5" /> },
-  { name: 'Settings', href: '#settings', icon: <Settings className="w-5 h-5" /> },
+  { name: 'File Manager', href: '/file-manager', icon: <FolderOpen className="w-5 h-5" /> },
+  { name: 'Applications', href: '/applications', icon: <Box className="w-5 h-5" /> },
+  { name: 'Containers', href: '/containers', icon: <Container className="w-5 h-5" /> },
+  { name: 'Domains', href: '/domains', icon: <Globe className="w-5 h-5" /> },
+  { name: 'Databases', href: '/databases', icon: <Database className="w-5 h-5" /> },
+  { name: 'SSL Certificates', href: '/ssl', icon: <ShieldCheck className="w-5 h-5" /> },
+  { name: 'Cron Jobs', href: '/cron', icon: <Clock className="w-5 h-5" /> },
+  { name: 'Backups', href: '/backups', icon: <ArchiveRestore className="w-5 h-5" /> },
+  { name: 'Terminal', href: '/terminal', icon: <Terminal className="w-5 h-5" /> },
+  { name: 'Env Variables', href: '/env', icon: <TerminalSquare className="w-5 h-5" /> },
+  { name: 'Monitoring', href: '/monitoring', icon: <Activity className="w-5 h-5" /> },
+  { name: 'Settings', href: '/settings', icon: <Settings className="w-5 h-5" /> },
 ];
 
 export const Sidebar: React.FC<{ isOpen: boolean; setIsOpen: (val: boolean) => void }> = ({ isOpen, setIsOpen }) => {
