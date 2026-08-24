@@ -1,69 +1,98 @@
-'use client';
-import { useEffect, useState } from 'react';
-import axios from 'axios';
+"use client";
 
-export default function Home() {
-  const [data, setData] = useState({ stats: { memory: {}, cpu: {}, disk: {} }, apps: [] });
-  const [error, setError] = useState(null);
+import React, { useState, useEffect } from 'react';
+import { HostStats } from '../components/dashboard/HostStats';
+import { UtilityCard } from '../components/utilities/UtilityCard';
+import {
+  LineChart,
+  Bot,
+  Rocket,
+  FileText
+} from 'lucide-react';
 
+export default function Dashboard() {
+  const [loading, setLoading] = useState(true);
+  const [stats, setStats] = useState({ cpu: 0, ram: { used: 0, total: 0 }, disk: 0 });
+
+  // Simulate API fetch for /api/stats
   useEffect(() => {
-    async function loadData() {
-      try {
-        const [statsRes, appsRes] = await Promise.all([
-          axios.get('/api/stats'),
-          axios.get('/api/apps')
-        ]);
-        setData({ stats: statsRes.data, apps: appsRes.data });
-      } catch (e) {
-        console.error('Failed to fetch data', e);
-        setError(e.message + ' | URL: ' + (e.config?.url || 'N/A'));
-      }
-    }
-    loadData();
+    const fetchStats = async () => {
+      // Mock delay
+      await new Promise(resolve => setTimeout(resolve, 800));
+      setStats({
+        cpu: 12,
+        ram: { used: 4.2, total: 24 },
+        disk: 65
+      });
+      setLoading(false);
+    };
+    fetchStats();
   }, []);
 
   return (
-    <div className="p-8 max-w-6xl mx-auto font-sans">
-      {error && <div className="bg-red-900 text-white p-4 mb-4 rounded">Error: {error}</div>}
-      <div className="flex justify-between items-center mb-10">
-        <h1 className="text-2xl font-bold tracking-tight">K-PANEL</h1>
-        <button onClick={() => window.location.reload()} className="bg-gray-900 px-4 py-2 rounded text-xs font-bold uppercase hover:bg-gray-800">Refresh</button>
+    <div className="space-y-8">
+      <div>
+        <h1 className="text-3xl font-bold tracking-tight">Overview</h1>
+        <p className="text-muted-foreground mt-2">
+          Monitor your server and manage your applications.
+        </p>
       </div>
 
-      <div className="grid grid-cols-4 gap-4 mb-10">
-        <div className="bg-gray-900 border border-gray-800 p-6 rounded-xl">
-          <p className="text-gray-500 text-[10px] uppercase font-bold tracking-widest mb-1">RAM</p>
-          <div className="text-2xl font-bold">{(data.stats.memory.used / 1024**3 || 0).toFixed(1)}GB</div>
-        </div>
-        <div className="bg-gray-900 border border-gray-800 p-6 rounded-xl">
-          <p className="text-gray-500 text-[10px] uppercase font-bold tracking-widest mb-1">CPU</p>
-          <div className="text-2xl font-bold">{data.stats.cpu.cores || 0} Cores</div>
-        </div>
-        <div className="bg-gray-900 border border-gray-800 p-6 rounded-xl">
-          <p className="text-gray-500 text-[10px] uppercase font-bold tracking-widest mb-1">DISK</p>
-          <div className="text-2xl font-bold">{data.stats.disk.percent || 0}%</div>
-        </div>
-        <div className="bg-gray-900 border border-gray-800 p-6 rounded-xl">
-          <p className="text-gray-500 text-[10px] uppercase font-bold tracking-widest mb-1">APPS</p>
-          <div className="text-2xl font-bold">{data.apps.length}</div>
-        </div>
-      </div>
+      {/* Stats Section */}
+      <section>
+        <HostStats
+          cpuUsage={stats.cpu}
+          ramUsage={stats.ram}
+          diskUsage={stats.disk}
+          loading={loading}
+        />
+      </section>
 
-      <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-        <table className="w-full text-sm text-left">
-          <thead className="bg-gray-800 text-gray-400 uppercase text-[10px] tracking-widest">
-            <tr><th className="p-4">CONTAINER</th><th className="p-4">STATUS</th></tr>
-          </thead>
-          <tbody className="divide-y divide-gray-800">
-            {data.apps.map(app => (
-              <tr key={app.id}>
-                <td className="p-4 font-bold">{app.name}</td>
-                <td className="p-4 text-blue-400">{app.status}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {/* Utilities Section */}
+      <section>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-xl font-semibold tracking-tight">Quick Tools</h2>
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+
+          <UtilityCard
+            title="Website Analyzer"
+            description="Scan your domains for performance and SEO improvements."
+            icon={<LineChart className="w-6 h-6" />}
+            actionText="Analyze Domain"
+            status="healthy"
+            onAction={() => console.log('Analyze domain clicked')}
+          />
+
+          <UtilityCard
+            title="Log Explorer"
+            description="View real-time access and error logs for your applications."
+            icon={<FileText className="w-6 h-6" />}
+            actionText="View Logs"
+            status="inactive"
+            onAction={() => console.log('View logs clicked')}
+          />
+
+          <UtilityCard
+            title="AI Assistant"
+            description="Get help with configuration, debugging, or optimization."
+            icon={<Bot className="w-6 h-6" />}
+            actionText="Ask AI"
+            status="healthy"
+            onAction={() => console.log('AI Assistant clicked')}
+          />
+
+          <UtilityCard
+            title="1-Click Deploy"
+            description="Deploy popular stacks (WordPress, Node, Laravel) instantly."
+            icon={<Rocket className="w-6 h-6" />}
+            actionText="Deploy App"
+            status="healthy"
+            onAction={() => console.log('Deploy app clicked')}
+          />
+
+        </div>
+      </section>
     </div>
   );
 }

@@ -1,19 +1,26 @@
 import type { Metadata } from "next";
+import { Inter } from "next/font/google";
+import "./globals.css";
+import { DashboardLayout } from "../components/layout/DashboardLayout";
+
+const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "K-Panel | Control Center",
-  description: "Minimalist VPS Management",
+  title: "K-Panel | VPS Management",
+  description: "Lightweight alternative to Hostinger hPanel / Coolify",
 };
 
 export default function RootLayout({
   children,
-}: {
+}: Readonly<{
   children: React.ReactNode;
-}) {
+}>) {
   return (
     <html lang="en" className="dark">
-      <body className="bg-black text-white min-h-screen">
-        {children}
+      <body className={inter.className}>
+        <DashboardLayout>
+          {children}
+        </DashboardLayout>
       </body>
     </html>
   );
