@@ -9,6 +9,7 @@ const dns = require('dns').promises;
 const https = require('https');
 const http = require('http');
 const tls = require('tls');
+const { execSync, exec } = require('child_process');
 require('dotenv').config();
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
@@ -1152,7 +1153,6 @@ app.post('/api/env/save', async (req, res) => {
 // ── 6. SETTINGS & SYSTEM MAINTENANCE API ──────────────────
 app.get(['/api/settings', '/api/settings/system'], (req, res) => {
   try {
-
     let distro = `${os.type()} ${os.release()}`;
     try {
       if (fs.existsSync('/etc/os-release')) {
@@ -1200,7 +1200,68 @@ app.get(['/api/settings', '/api/settings/system'], (req, res) => {
     const hours = Math.floor((uptimeSec % 86400) / 3600);
     const minutes = Math.floor((uptimeSec % 3600) / 60);
 
+    // Live Docker disk space usage
+    let dockerUsage = {
+      images: { total: '0', active: '0', size: '0 B', reclaimable: '0 B' },
+      containers: { total: '0', active: '0', size: '0 B', reclaimable: '0 B' },
+      volumes: { total: '0', active: '0', size: '0 B', reclaimable: '0 B' },
+      buildCache: { total: '0', active: '0', size: '0 B', reclaimable: '0 B' }
+    };
+
+    try {
+      const dfOut = execSync("docker system df --format '{{json .}}' 2>/dev/null", { timeout: 10000 }).toString().trim();
+      const lines = dfOut.split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const item = JSON.parse(line);
+          const type = (item.Type || '').toLowerCase();
+          const entry = {
+            total: item.TotalCount || '0',
+            active: item.Active || '0',
+            size: item.Size || '0 B',
+            reclaimable: item.Reclaimable || '0 B'
+          };
+          if (type.includes('image')) dockerUsage.images = entry;
+          else if (type.includes('container')) dockerUsage.containers = entry;
+          else if (type.includes('volume')) dockerUsage.volumes = entry;
+          else if (type.includes('build')) dockerUsage.buildCache = entry;
+        } catch {}
+      }
+    } catch (e) {
+      fileLog(`Failed to get docker system df: ${e.message}`);
+    }
+
+    const serverObj = {
+      hostname: os.hostname(),
+      osType: os.type(),
+      osRelease: os.release(),
+      distro,
+      kernel,
+      arch: os.arch(),
+      uptime: uptimeSec,
+      uptimeFormatted: `${days}d ${hours}h ${minutes}m`,
+      nodeVersion: process.version,
+      dockerVersion: dockerVer,
+      cpus: cpuCores,
+      cpuModel,
+      totalMemoryGB: parseFloat((totalMem / (1024 ** 3)).toFixed(1)),
+      usedMemoryGB: parseFloat((usedMem / (1024 ** 3)).toFixed(1)),
+      disk,
+      memory: {
+        total: totalMem,
+        used: usedMem,
+        free: freeMem,
+        totalGB: parseFloat((totalMem / (1024 ** 3)).toFixed(1)),
+        usedGB: parseFloat((usedMem / (1024 ** 3)).toFixed(1)),
+        freeGB: parseFloat((freeMem / (1024 ** 3)).toFixed(1)),
+        percent: parseFloat(((usedMem / totalMem) * 100).toFixed(1))
+      },
+      serverTime: new Date().toISOString()
+    };
+
     res.json({
+      server: serverObj,
+      dockerUsage,
       os: {
         type: os.type(),
         platform: os.platform(),
@@ -1220,17 +1281,9 @@ app.get(['/api/settings', '/api/settings/system'], (req, res) => {
         loadAvg: os.loadavg(),
         percent: calculateCpuUsage()
       },
-      memory: {
-        total: totalMem,
-        used: usedMem,
-        free: freeMem,
-        totalGB: parseFloat((totalMem / (1024 ** 3)).toFixed(1)),
-        usedGB: parseFloat((usedMem / (1024 ** 3)).toFixed(1)),
-        freeGB: parseFloat((freeMem / (1024 ** 3)).toFixed(1)),
-        percent: parseFloat(((usedMem / totalMem) * 100).toFixed(1))
-      },
+      memory: serverObj.memory,
       disk,
-      serverTime: new Date().toISOString()
+      serverTime: serverObj.serverTime
     });
   } catch (err) {
     fileLog(`System settings error: ${err.message}`);
@@ -1239,37 +1292,44 @@ app.get(['/api/settings', '/api/settings/system'], (req, res) => {
 });
 
 app.post('/api/settings/prune', (req, res) => {
-  const { type } = req.body;
-  let cmd = '';
+  try {
+    const { type } = req.body || {};
+    let cmd = '';
 
-  if (type === 'builder') {
-    cmd = 'docker builder prune -a -f 2>&1';
-  } else if (type === 'containers') {
-    cmd = 'docker container prune -f 2>&1';
-  } else if (type === 'images') {
-    cmd = 'docker image prune -a -f 2>&1';
-  } else {
-    // Default: system prune
-    cmd = 'docker system prune -f 2>&1';
-  }
+    if (type === 'builder') {
+      cmd = 'docker builder prune -a -f 2>&1';
+    } else if (type === 'containers') {
+      cmd = 'docker container prune -f 2>&1';
+    } else if (type === 'images') {
+      cmd = 'docker image prune -a -f 2>&1';
+    } else if (type === 'volumes') {
+      cmd = 'docker volume prune -f 2>&1';
+    } else {
+      // Default: system prune
+      cmd = 'docker system prune -f 2>&1';
+    }
 
-  fileLog(`Executing prune [${type || 'system'}]: ${cmd}`);
+    fileLog(`Executing prune [${type || 'system'}]: ${cmd}`);
 
-  exec(cmd, { timeout: 120000 }, (error, stdout, stderr) => {
-    const out = stdout || stderr || '';
-    const match = out.match(/Total reclaimed space:\s*([^\n\r]+)/i);
-    const reclaimedSpace = match ? match[1].trim() : '0 B';
+    exec(cmd, { timeout: 180000 }, (error, stdout, stderr) => {
+      const out = (stdout || stderr || '').trim();
+      const match = out.match(/Total reclaimed space:\s*([^\n\r]+)/i);
+      const reclaimedSpace = match ? match[1].trim() : '0 B';
 
-    fileLog(`Prune [${type}] completed: reclaimed ${reclaimedSpace}`);
+      fileLog(`Prune [${type}] completed: reclaimed ${reclaimedSpace}`);
 
-    res.json({
-      success: !error,
-      type: type || 'system',
-      output: out.trim(),
-      reclaimedSpace,
-      timestamp: new Date().toISOString()
+      return res.json({
+        success: !error,
+        type: type || 'system',
+        output: out || 'Cleanup completed successfully.',
+        reclaimedSpace,
+        timestamp: new Date().toISOString()
+      });
     });
-  });
+  } catch (err) {
+    fileLog(`Prune error: ${err.message}`);
+    return res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ── 7. WEBSITE ANALYZER ENGINE ────────────────────────────
