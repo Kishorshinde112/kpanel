@@ -1,10 +1,10 @@
 "use client";
 
 import React, { useState, useEffect } from 'react';
-import { Menu, Bell, Search, User, Server } from 'lucide-react';
+import { Menu, Bell, Search, User, Server, Bot, Sparkles } from 'lucide-react';
 import { cn } from '../../lib/utils';
 
-export const TopNav: React.FC<{ onMenuClick: () => void }> = ({ onMenuClick }) => {
+export const TopNav: React.FC<{ onMenuClick: () => void; onAiClick?: () => void }> = ({ onMenuClick, onAiClick }) => {
   const [status, setStatus] = useState<'healthy' | 'high_load'>('healthy');
   const [showNotifications, setShowNotifications] = useState(false);
 
@@ -55,7 +55,17 @@ export const TopNav: React.FC<{ onMenuClick: () => void }> = ({ onMenuClick }) =
         </div>
 
         {/* Right Actions */}
-        <div className="flex items-center gap-3 sm:gap-4">
+        <div className="flex items-center gap-2 sm:gap-3">
+
+          {/* Quick AI Assistant Trigger */}
+          <button
+            onClick={onAiClick}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-gradient-to-r from-purple-500/20 to-blue-500/20 hover:from-purple-500/30 hover:to-blue-500/30 text-purple-300 border border-purple-500/30 shadow-sm transition-all hover:scale-105 active:scale-95"
+            title="Open K-Panel AI Assistant"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-purple-400 animate-pulse" />
+            <span>Ask AI</span>
+          </button>
 
           {/* Dynamic Server Status Indicator */}
           <div className="hidden sm:flex items-center gap-2 rounded-full border px-3 py-1 text-sm bg-muted/50">
