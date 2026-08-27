@@ -8,16 +8,22 @@ export const HostStats: React.FC<HostStatsProps> = ({ cpuUsage, ramUsage, diskUs
     return (
       <Card>
         <CardHeader>
-          <CardTitle className="text-lg">Host Statistics</CardTitle>
+          <CardTitle className="text-lg font-semibold">Server Resources</CardTitle>
         </CardHeader>
-        <CardContent className="flex justify-center items-center h-24">
-          <div className="animate-pulse flex space-x-4">
-            <div className="h-4 w-3/4 bg-muted rounded"></div>
-          </div>
+        <CardContent className="grid gap-4 md:grid-cols-3">
+          {[1, 2, 3].map((i) => (
+            <div key={i} className="p-4 border rounded-lg bg-card animate-pulse space-y-3">
+              <div className="h-4 w-24 bg-muted rounded"></div>
+              <div className="h-8 w-16 bg-muted rounded"></div>
+              <div className="h-2 w-full bg-muted rounded"></div>
+            </div>
+          ))}
         </CardContent>
       </Card>
     );
   }
+
+  const ramPercent = ramUsage.total > 0 ? Math.min(100, Math.round((ramUsage.used / ramUsage.total) * 100)) : 0;
 
   return (
     <Card>
@@ -37,8 +43,11 @@ export const HostStats: React.FC<HostStatsProps> = ({ cpuUsage, ramUsage, diskUs
           <div className="text-2xl font-bold">
             {cpuUsage}%
           </div>
-          <div className="w-full bg-muted rounded-full h-2.5">
-            <div className="bg-primary h-2.5 rounded-full" style={{ width: `${cpuUsage}%` }}></div>
+          <div className="w-full bg-muted rounded-full h-2.5 overflow-hidden">
+            <div
+              className={`h-2.5 rounded-full transition-all duration-500 ${cpuUsage > 80 ? 'bg-red-500' : cpuUsage > 50 ? 'bg-yellow-500' : 'bg-primary'}`}
+              style={{ width: `${Math.min(100, Math.max(2, cpuUsage))}%` }}
+            ></div>
           </div>
         </div>
 
@@ -49,10 +58,13 @@ export const HostStats: React.FC<HostStatsProps> = ({ cpuUsage, ramUsage, diskUs
             <span className="text-sm font-medium">RAM Usage</span>
           </div>
           <div className="text-2xl font-bold">
-            {ramUsage.used.toFixed(1)} GB <span className="text-sm text-muted-foreground font-normal">/ {ramUsage.total} GB</span>
+            {ramUsage.used.toFixed(1)} GB <span className="text-sm text-muted-foreground font-normal">/ {ramUsage.total.toFixed(1)} GB</span>
           </div>
-          <div className="w-full bg-muted rounded-full h-2.5">
-            <div className="bg-primary h-2.5 rounded-full" style={{ width: `${(ramUsage.used / ramUsage.total) * 100}%` }}></div>
+          <div className="w-full bg-muted rounded-full h-2.5 overflow-hidden">
+            <div
+              className={`h-2.5 rounded-full transition-all duration-500 ${ramPercent > 85 ? 'bg-red-500' : ramPercent > 70 ? 'bg-yellow-500' : 'bg-primary'}`}
+              style={{ width: `${Math.min(100, Math.max(2, ramPercent))}%` }}
+            ></div>
           </div>
         </div>
 
@@ -65,8 +77,11 @@ export const HostStats: React.FC<HostStatsProps> = ({ cpuUsage, ramUsage, diskUs
           <div className="text-2xl font-bold">
             {diskUsage}% <span className="text-sm text-muted-foreground font-normal">Used</span>
           </div>
-          <div className="w-full bg-muted rounded-full h-2.5">
-            <div className="bg-primary h-2.5 rounded-full" style={{ width: `${diskUsage}%` }}></div>
+          <div className="w-full bg-muted rounded-full h-2.5 overflow-hidden">
+            <div
+              className={`h-2.5 rounded-full transition-all duration-500 ${diskUsage > 85 ? 'bg-red-500' : 'bg-primary'}`}
+              style={{ width: `${Math.min(100, Math.max(2, diskUsage))}%` }}
+            ></div>
           </div>
         </div>
 

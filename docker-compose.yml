@@ -1,38 +1,46 @@
 services:
   backend:
     build: ./backend
-    ports:
-      - "5011:5001"
+    container_name: kpanel-backend-1
+    restart: always
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./backend/data:/app/data
-    restart: always
+      - ./backend/server.js:/app/server.js
+      - ./backend/.env:/app/.env
+      - /home/ubuntu:/home/ubuntu
+    environment:
+      - PORT=5001
+    ports:
+      - "127.0.0.1:5001:5001"
     networks:
-      - coolify
+      - kpanel_net
     labels:
-      - traefik.enable=true
-      - traefik.docker.network=coolify
-      - traefik.http.routers.kpanel-backend.rule=Host(`kpanel.kishorlab.dev`) && PathPrefix(`/api`)
-      - traefik.http.routers.kpanel-backend.entrypoints=http,https
-      - traefik.http.routers.kpanel-backend.tls.certresolver=letsencrypt
-      - traefik.http.services.kpanel-backend.loadbalancer.server.port=5001
+      - "traefik.enable=true"
+      - "traefik.http.routers.kpanel-api.rule=Host(`kpanel.kishorlab.dev`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.kpanel-api.priority=20"
+      - "traefik.http.routers.kpanel-api.entrypoints=websecure"
+      - "traefik.http.routers.kpanel-api.tls=true"
+      - "traefik.http.services.kpanel-api.loadbalancer.server.port=5001"
+
   frontend:
     build: ./frontend
-    ports:
-      - "3005:3000"
+    container_name: kpanel-frontend-1
     restart: always
-    networks:
-      - coolify
     environment:
       - BACKEND_URL=http://backend:5001
+    ports:
+      - "127.0.0.1:3030:3000"
+    networks:
+      - kpanel_net
     labels:
-      - traefik.enable=true
-      - traefik.docker.network=coolify
-      - traefik.http.routers.kpanel-frontend.rule=Host(`kpanel.kishorlab.dev`)
-      - traefik.http.routers.kpanel-frontend.entrypoints=http,https
-      - traefik.http.routers.kpanel-frontend.tls.certresolver=letsencrypt
-      - traefik.http.services.kpanel-frontend.loadbalancer.server.port=3000
+      - "traefik.enable=true"
+      - "traefik.http.routers.kpanel-frontend.rule=Host(`kpanel.kishorlab.dev`) && PathPrefix(`/`)"
+      - "traefik.http.routers.kpanel-frontend.priority=10"
+      - "traefik.http.routers.kpanel-frontend.entrypoints=websecure"
+      - "traefik.http.routers.kpanel-frontend.tls=true"
+      - "traefik.http.services.kpanel-frontend.loadbalancer.server.port=3000"
 
 networks:
-  coolify:
-    external: true
+  kpanel_net:
+    driver: bridge
