@@ -147,41 +147,89 @@ app.get('/api/zero-trust', (req, res) => {
 });
 
 // ── System Stats ──────────────────────────────────────────
-let lastCpuUsage = 0;
+let prevCpuTimes = null;
+let lastCalculatedCpu = 10;
+
 function calculateCpuUsage() {
   try {
+    const stat = fs.readFileSync('/proc/stat', 'utf8').split('\n')[0];
+    const parts = stat.replace('cpu', '').trim().split(/\s+/).map(Number);
+    const idle = parts[3] + (parts[4] || 0); // idle + iowait
+    const total = parts.reduce((a, b) => a + b, 0);
+
+    if (prevCpuTimes) {
+      const idleDelta = idle - prevCpuTimes.idle;
+      const totalDelta = total - prevCpuTimes.total;
+      prevCpuTimes = { idle, total };
+      if (totalDelta > 0) {
+        lastCalculatedCpu = Math.min(100, Math.max(0, Math.round(((totalDelta - idleDelta) / totalDelta) * 100)));
+        return lastCalculatedCpu;
+      }
+    }
+    prevCpuTimes = { idle, total };
     const load1 = os.loadavg()[0];
     const cores = os.cpus().length || 1;
-    const usage = Math.min(100, Math.max(1, Math.round((load1 / cores) * 100)));
-    lastCpuUsage = usage;
-    return usage;
+    lastCalculatedCpu = Math.min(100, Math.max(1, Math.round((load1 / cores) * 100)));
+    return lastCalculatedCpu;
   } catch {
-    return lastCpuUsage || 10;
+    const load1 = os.loadavg()[0];
+    const cores = os.cpus().length || 1;
+    lastCalculatedCpu = Math.min(100, Math.max(1, Math.round((load1 / cores) * 100)));
+    return lastCalculatedCpu;
   }
 }
 
+function getExactMemory() {
+  try {
+    const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+    const totalMatch = meminfo.match(/MemTotal:\s+(\d+)/);
+    const availMatch = meminfo.match(/MemAvailable:\s+(\d+)/);
+    if (totalMatch && availMatch) {
+      const totalKB = parseInt(totalMatch[1], 10);
+      const availKB = parseInt(availMatch[1], 10);
+      const usedKB = totalKB - availKB;
+      return {
+        used: usedKB * 1024,
+        total: totalKB * 1024,
+        usedGB: parseFloat((usedKB / (1024 * 1024)).toFixed(1)),
+        totalGB: parseFloat((totalKB / (1024 * 1024)).toFixed(1)),
+        percent: parseFloat(((usedKB / totalKB) * 100).toFixed(1))
+      };
+    }
+  } catch {}
+  const total = os.totalmem();
+  const used = total - os.freemem();
+  return {
+    used,
+    total,
+    usedGB: parseFloat((used / (1024 ** 3)).toFixed(1)),
+    totalGB: parseFloat((total / (1024 ** 3)).toFixed(1)),
+    percent: parseFloat(((used / total) * 100).toFixed(1))
+  };
+}
+
+// Background sampling for precise CPU delta
+setInterval(() => {
+  calculateCpuUsage();
+}, 2000);
+
 app.get('/api/stats', async (req, res) => {
   try {
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-    const usedMem = totalMem - freeMem;
+    const mem = getExactMemory();
     const cpuCores = os.cpus().length;
     const cpuPercent = calculateCpuUsage();
     
-    let diskPercent = 60;
+    let diskPercent = 70;
     try {
-      const dfOut = execSync('df -B1 /').toString().split('\n')[1].split(/\s+/);
-      diskPercent = parseFloat(dfOut[4].replace('%', ''));
+      const dfOut = execSync('df -k / 2>/dev/null', { timeout: 3000 }).toString().trim().split('\n');
+      if (dfOut.length > 1) {
+        const parts = dfOut[1].split(/\s+/);
+        diskPercent = parseFloat(parts[4].replace('%', ''));
+      }
     } catch {}
 
     res.json({
-      memory: {
-        used: usedMem,
-        total: totalMem,
-        usedGB: parseFloat((usedMem / (1024 ** 3)).toFixed(1)),
-        totalGB: parseFloat((totalMem / (1024 ** 3)).toFixed(1)),
-        percent: parseFloat(((usedMem / totalMem) * 100).toFixed(1))
-      },
+      memory: mem,
       cpu: {
         cores: cpuCores,
         loadAvg: os.loadavg(),
