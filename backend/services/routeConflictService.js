@@ -44,6 +44,38 @@ function matchesWildcard(targetDomain, wildcardDomain) {
 }
 
 /**
+ * Safely evaluates if a regex pattern is safe for bounded execution.
+ * Rejects patterns that could cause catastrophic backtracking (ReDoS),
+ * excessive length, lookarounds, backreferences, or nested repetitions.
+ *
+ * @param {string} pattern - Raw or substituted regex pattern
+ * @returns {boolean} True if pattern passes conservative safety boundaries
+ */
+function isSafeRegexPattern(pattern) {
+  if (!pattern || typeof pattern !== 'string') return false;
+  const clean = pattern.trim();
+  // 1. Length boundary: max 128 characters
+  if (clean.length > 128) return false;
+
+  // 2. Reject lookaheads, lookbehinds, backreferences
+  if (/\(\?[=!<]/.test(clean) || /\\[1-9]/.test(clean)) return false;
+
+  // 3. Reject nested quantifiers e.g. (a+)+, (a*)*, ([a-z]+)+, (a{1,5})+
+  if (/\([^)]*(\+|\*|\{[0-9]+,[0-9]*\})[^)]*\)(\+|\*|\{[0-9]+,[0-9]*\})/.test(clean)) return false;
+
+  // 4. Reject nested parentheses with outer repetition
+  if (/\(\([^)]+\)[+*]\)[+*]/.test(clean)) return false;
+
+  // 5. Reject overlapping alternations with repetition e.g. (a|a)+ or (a|aa)+
+  if (/\(([a-z0-9]+)\|(\1[a-z0-9]*)\)[+*]/i.test(clean)) return false;
+
+  // 6. Reject consecutive wildcards like .*.*, .+.+
+  if (/\.[*+]\.?\.[*+]/.test(clean)) return false;
+
+  return true;
+}
+
+/**
  * Evaluates a proposed K-Panel routing plan against a complete Traefik topology snapshot.
  * Detects exact host collisions, regex patterns, wildcards, provider namespaces,
  * and foreign workloads (Dokploy, n8n, other applications).
@@ -141,10 +173,37 @@ function evaluateRouteConflicts(input, topology, options = {}) {
     // Check C: HostRegexp Match
     if (!isMatch && router.regexPatterns && router.regexPatterns.length > 0) {
       for (const pattern of router.regexPatterns) {
+        // Step 1: Check pattern safety before evaluation to prevent ReDoS / backtracking
+        if (!isSafeRegexPattern(pattern)) {
+          hasUndetermined = true;
+          conflicts.push({
+            routerName: router.name,
+            provider: router.provider,
+            rule: router.rule,
+            conflictType: 'UNDETERMINED_REGEX',
+            message: `Router "${router.name}" has an unsafe, complex, or unbounded HostRegexp pattern.`
+          });
+          continue;
+        }
+
         try {
           // Traefik HostRegexp can use named capture syntax: {subdomain:[a-z0-9-]+}.example.com
           // Convert Traefik capture syntax to standard JS regex for evaluation
           const jsPattern = pattern.replace(/\{[a-zA-Z0-9_-]+:([^}]+)\}/g, '($1)');
+
+          // Step 2: Validate converted pattern as well
+          if (!isSafeRegexPattern(jsPattern)) {
+            hasUndetermined = true;
+            conflicts.push({
+              routerName: router.name,
+              provider: router.provider,
+              rule: router.rule,
+              conflictType: 'UNDETERMINED_REGEX',
+              message: `Router "${router.name}" has an unsafe converted HostRegexp pattern.`
+            });
+            continue;
+          }
+
           const regex = new RegExp(`^${jsPattern}$`, 'i');
           if (regex.test(cleanTargetDomain)) {
             isMatch = true;
@@ -269,6 +328,7 @@ module.exports = {
   evaluateRouteConflicts,
   matchesWildcard,
   entryPointsOverlap,
+  isSafeRegexPattern,
   CONFLICT_DECISIONS,
   RouteConflictError
 };

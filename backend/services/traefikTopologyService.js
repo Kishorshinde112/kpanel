@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 
 /**
  * Structured service error class for Traefik Topology operations.
@@ -159,8 +160,57 @@ function inspectRoutingTopology(options = {}) {
       };
     }
   } else if (options.snapshotPath && typeof options.snapshotPath === 'string') {
+    const rawPath = options.snapshotPath.trim();
+    // Path traversal and null byte rejection
+    if (rawPath.includes('\0') || rawPath.includes('..')) {
+      return {
+        status: 'UNAVAILABLE',
+        source: 'file',
+        routers: [],
+        services: [],
+        providers: [],
+        snapshotFingerprint: null,
+        checkedAt: new Date().toISOString(),
+        reason: 'UNAUTHORIZED_SNAPSHOT_PATH',
+        message: 'Snapshot path contains invalid traversal characters or null bytes.'
+      };
+    }
+
+    const resolvedPath = path.resolve(rawPath);
+    const forbiddenPrefixes = ['/etc', '/proc', '/sys', '/dev', '/var/run', '/root', '/boot'];
+    if (forbiddenPrefixes.some((p) => resolvedPath === p || resolvedPath.startsWith(p + path.sep))) {
+      return {
+        status: 'UNAVAILABLE',
+        source: 'file',
+        routers: [],
+        services: [],
+        providers: [],
+        snapshotFingerprint: null,
+        checkedAt: new Date().toISOString(),
+        reason: 'UNAUTHORIZED_SNAPSHOT_PATH',
+        message: `Snapshot path "${resolvedPath}" is within an unauthorized system directory.`
+      };
+    }
+
+    if (options.allowedDirectory) {
+      const allowedRoot = path.resolve(options.allowedDirectory);
+      if (resolvedPath !== allowedRoot && !resolvedPath.startsWith(allowedRoot + path.sep)) {
+        return {
+          status: 'UNAVAILABLE',
+          source: 'file',
+          routers: [],
+          services: [],
+          providers: [],
+          snapshotFingerprint: null,
+          checkedAt: new Date().toISOString(),
+          reason: 'UNAUTHORIZED_SNAPSHOT_PATH',
+          message: `Snapshot path "${resolvedPath}" is outside the authorized directory.`
+        };
+      }
+    }
+
     try {
-      if (!fs.existsSync(options.snapshotPath)) {
+      if (!fs.existsSync(resolvedPath)) {
         return {
           status: 'UNAVAILABLE',
           source: 'file',
@@ -170,10 +220,10 @@ function inspectRoutingTopology(options = {}) {
           snapshotFingerprint: null,
           checkedAt: new Date().toISOString(),
           reason: 'SNAPSHOT_FILE_NOT_FOUND',
-          message: `Snapshot file not found at path "${options.snapshotPath}".`
+          message: `Snapshot file not found at path "${resolvedPath}".`
         };
       }
-      const fileContent = fs.readFileSync(options.snapshotPath, 'utf8');
+      const fileContent = fs.readFileSync(resolvedPath, 'utf8');
       rawData = JSON.parse(fileContent);
     } catch (fileErr) {
       return {
@@ -208,6 +258,21 @@ function inspectRoutingTopology(options = {}) {
   // 2. Normalize Routers
   const normalizedRouters = [];
   const providersSet = new Set();
+
+  if (Array.isArray(rawData.providers)) {
+    for (const p of rawData.providers) {
+      if (typeof p === 'string' && p.trim()) {
+        providersSet.add(p.trim().toLowerCase());
+      }
+    }
+  }
+  if (Array.isArray(options.providers)) {
+    for (const p of options.providers) {
+      if (typeof p === 'string' && p.trim()) {
+        providersSet.add(p.trim().toLowerCase());
+      }
+    }
+  }
 
   // Support both Traefik API map format ({ [routerName]: routerObj }) and array format
   const rawRouters = rawData.routers || rawData.http?.routers || [];
@@ -296,10 +361,46 @@ function inspectRoutingTopology(options = {}) {
   }
 
   const snapshotFingerprint = computeTopologyFingerprint(normalizedRouters);
+  const capturedAt = options.capturedAt || rawData.capturedAt || rawData.checkedAt || new Date().toISOString();
+
+  let freshnessStatus = options.freshnessStatus;
+  if (!freshnessStatus) {
+    if (options.expired === true) {
+      freshnessStatus = 'expired';
+    } else {
+      const maxAgeMs = options.maxAgeMs !== undefined ? options.maxAgeMs : (rawData.maxAgeMs || 60000);
+      const snapTime = Date.parse(capturedAt);
+      const isExpired = isNaN(snapTime) || (Date.now() - snapTime > maxAgeMs);
+      freshnessStatus = isExpired ? 'expired' : 'fresh';
+    }
+  }
+
+  const sourceType = options.sourceType || (options.snapshot ? 'memory' : (options.snapshotPath ? 'file' : 'json-string'));
+  // Security: A JSON payload field claiming `originVerified: true` must NOT itself establish trust.
+  // Provenance is determined strictly by the server-side adapter and configured source.
+  // Injected memory snapshots in server tests are trusted; unverified files and JSON strings are not.
+  const originVerified = Boolean(
+    options.originVerified !== undefined
+      ? options.originVerified
+      : (options.trustedAdapter === true || (Boolean(options.snapshot) && !options.snapshotPath && !options.untrustedSnapshot))
+  );
+  const traefikInstanceId = rawData.traefikInstanceId || rawData.instanceId || options.traefikInstanceId || null;
+  const configurationVersion = rawData.configurationVersion || rawData.version || null;
+  const providerMetadata = rawData.providerMetadata || options.providerMetadata || {
+    active: Array.from(providersSet),
+    file: { directoryConfigured: providersSet.has('file') }
+  };
 
   return {
     status: 'AVAILABLE',
-    source: options.snapshot ? 'memory' : (options.snapshotPath ? 'file' : 'json-string'),
+    source: sourceType,
+    sourceType,
+    capturedAt,
+    freshnessStatus,
+    originVerified,
+    traefikInstanceId,
+    configurationVersion,
+    providerMetadata,
     routers: normalizedRouters,
     services: normalizedServices,
     providers: Array.from(providersSet),

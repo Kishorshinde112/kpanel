@@ -333,6 +333,16 @@ async function validateActivationPreflight(releasePlanId, options = {}) {
   const isTopologyAvailable = topology.status === 'AVAILABLE';
   recordCheck('TOPOLOGY_AVAILABLE', isTopologyAvailable, isTopologyAvailable ? `Topology verified with ${topology.routers?.length || 0} routers.` : 'Traefik routing topology is unavailable.');
 
+  const isFresh = topology.freshnessStatus === 'fresh';
+  recordCheck('TOPOLOGY_FRESHNESS_VERIFIED', isFresh, isFresh ? 'Topology snapshot is fresh.' : 'Topology snapshot is expired.');
+
+  const isOriginVerified = Boolean(
+    topology.originVerified !== undefined
+      ? topology.originVerified
+      : (options.trustedAdapter === true || (Boolean(options.snapshot) && !options.snapshotPath))
+  );
+  recordCheck('TOPOLOGY_ORIGIN_VERIFIED', isOriginVerified, isOriginVerified ? 'Topology snapshot provenance verified.' : 'Topology snapshot origin cannot be verified.');
+
   const conflictReport = isTopologyAvailable
     ? routeConflictService.evaluateRouteConflicts({
         targetDomain: plan.target_domain,
@@ -344,8 +354,13 @@ async function validateActivationPreflight(releasePlanId, options = {}) {
     conflictReport.decision === CONFLICT_DECISIONS.OWNED_BY_KPANEL;
   recordCheck('NO_FOREIGN_ROUTE_CONFLICT', noForeignConflict, noForeignConflict ? `Route is free or owned by K-Panel (${conflictReport.decision}).` : `Route conflict detected: ${conflictReport.message}`);
 
-  const providerConfigured = topology.providers && topology.providers.includes(options.requiredProvider || 'file');
-  recordCheck('ROUTING_PROVIDER_CONFIGURED', Boolean(providerConfigured), providerConfigured ? `Routing provider "${options.requiredProvider || 'file'}" active.` : `Required provider "${options.requiredProvider || 'file'}" not found in topology.`);
+  const isFileDirectoryConfigured = (options.requiredProvider || 'file') === 'file'
+    ? (topology.providerMetadata?.file?.directoryConfigured !== false)
+    : true;
+  const providerConfigured = topology.providers &&
+    topology.providers.includes(options.requiredProvider || 'file') &&
+    isFileDirectoryConfigured;
+  recordCheck('ROUTING_PROVIDER_CONFIGURED', Boolean(providerConfigured), providerConfigured ? `Routing provider "${options.requiredProvider || 'file'}" active.` : `Required provider "${options.requiredProvider || 'file'}" not properly configured in topology.`);
 
   // 19. Target network identity check
   const approvedNetwork = options.approvedProxyNetwork || process.env.KPANEL_PROXY_NETWORK_ID || 'traefik-public';
@@ -416,7 +431,7 @@ async function validateActivationPreflight(releasePlanId, options = {}) {
     decision = PREFLIGHT_DECISIONS.BLOCKED_BY_AUTHORIZATION_DRIFT;
   } else if (!domainMatches || !portMatches) {
     decision = PREFLIGHT_DECISIONS.BLOCKED_BY_UNVERIFIED_DOMAIN;
-  } else if (!isTopologyAvailable || !providerConfigured) {
+  } else if (!isTopologyAvailable || !providerConfigured || !isFresh || !isOriginVerified) {
     decision = PREFLIGHT_DECISIONS.BLOCKED_BY_PROVIDER_CONFIGURATION;
   } else if (!noForeignConflict) {
     decision = PREFLIGHT_DECISIONS.BLOCKED_BY_ROUTE_CONFLICT;

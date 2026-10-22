@@ -381,6 +381,14 @@ async function validateReleaseEligibility(deploymentId, options = {}) {
  * @returns {Object} { authorized: true, mode: 'trusted-operator' | 'worker', ownerId?: string, fencingToken?: number }
  */
 function verifyReleasePlanningAuthorization(options = {}, input = {}, db) {
+  // Reject if untrusted input payload attempts to smuggle operator authorization
+  if (input && (input.trustedOperator !== undefined || input.operatorContext !== undefined || input.adminAuthorized !== undefined)) {
+    throw new ReleasePlanningError(
+      'Untrusted payload cannot supply operator authorization.',
+      'UNAUTHORIZED_MUTATION'
+    );
+  }
+
   // Mode 1: Explicit trusted operator authorization (e.g. from internal administrative controller)
   // Input parameters can NEVER set trustedOperator (strictly read from options)
   if (options.trustedOperator === true) {
