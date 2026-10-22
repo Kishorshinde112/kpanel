@@ -748,9 +748,10 @@ test('Phase 4B2: Fenced Deployment Worker & BuildKit Integration Suite', async (
       assert.equal(preUpgradeDep.status, 'queued');
 
       // 3. Subsequently upgrade to migration 006
-      const upgradeResult = runMigrations(caseBDb);
+      const v1to6Migrations = loadMigrations().filter((m) => m.version <= 6);
+      const upgradeResult = runMigrations(caseBDb, v1to6Migrations);
       assert.equal(upgradeResult.applied, 1, 'Exactly one pending migration (006) must be applied');
-      assert.ok(upgradeResult.currentVersion >= 6, 'Schema version must now be at least 6');
+      assert.equal(upgradeResult.currentVersion, 6, 'Schema version must now be 6');
 
       // 4. Acquire the global lease
       const lease = deploymentLeaseService.acquireWorkerLease('worker-case-b', { db: caseBDb });
