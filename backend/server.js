@@ -22,42 +22,23 @@ const DEPLOY_LOGS = {};
 const LOG_FILE = path.join(__dirname, 'data', 'kpanel.log');
 
 // Ensure data and backup directories exist
-fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
-fs.mkdirSync('/home/ubuntu/backups', { recursive: true });
+try { fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true }); } catch {}
+try { fs.mkdirSync('/home/ubuntu/backups', { recursive: true }); } catch {}
 
-// ── Auth config ───────────────────────────────────────────
-const K_PANEL_PASSWORD = process.env.K_PANEL_PASSWORD || '';
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-const SESSIONS = new Set();
+// ── Auth config & Middleware ──────────────────────────────
+const {
+  authMiddleware,
+  loginHandler,
+  logoutHandler,
+  statusHandler,
+  isPasswordConfigured
+} = require('./middleware/auth');
 
 // ── Logging ───────────────────────────────────────────────
 function fileLog(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   try { fs.appendFileSync(LOG_FILE, line); } catch {}
   console.log(msg);
-}
-
-// ── Cookie helpers ────────────────────────────────────────
-function signToken(token) {
-  return token + '.' + crypto.createHmac('sha256', SESSION_SECRET).update(token).digest('hex');
-}
-function verifyToken(signed) {
-  if (!signed) return false;
-  const idx = signed.lastIndexOf('.');
-  if (idx === -1) return false;
-  const token = signed.slice(0, idx);
-  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(token).digest('hex');
-  const actual = signed.slice(idx + 1);
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(actual)) && SESSIONS.has(token);
-}
-function parseCookies(req) {
-  const raw = req.headers.cookie || '';
-  return Object.fromEntries(raw.split(';').map(c => c.trim().split('=').map(decodeURIComponent)));
-}
-
-// ── Auth middleware ───────────────────────────────────────
-function authMiddleware(req, res, next) {
-  next();
 }
 
 // ── General Helpers ───────────────────────────────────────
@@ -88,9 +69,24 @@ function formatPermissions(mode) {
 }
 
 // ── Middleware ────────────────────────────────────────────
+app.set('trust proxy', 1);
 app.use(cors({ origin: '*' }));
 app.use('/api/webhook', express.raw({ type: '*/*' }));
 app.use(express.json());
+
+// Handle malformed JSON request bodies gracefully
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    return res.status(400).json({
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Malformed JSON payload in request body.'
+      }
+    });
+  }
+  next(err);
+});
+
 app.use(authMiddleware);
 
 app.use((req, res, next) => {
@@ -100,38 +96,14 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Application Management Routes (Git Applications) ─────
+const applicationsRouter = require('./routes/applications');
+app.use('/api/applications', applicationsRouter);
+
 // ── Auth endpoints ────────────────────────────────────────
-app.post('/api/auth/login', (req, res) => {
-  if (!K_PANEL_PASSWORD || K_PANEL_PASSWORD.length === 0) return res.json({ success: true, noAuth: true });
-  const { password } = req.body;
-  if (!password || !crypto.timingSafeEqual(Buffer.from(password), Buffer.from(K_PANEL_PASSWORD))) {
-    fileLog(`Failed login attempt from ${req.ip}`);
-    return res.status(401).json({ error: 'Invalid password' });
-  }
-  const token = crypto.randomBytes(32).toString('hex');
-  SESSIONS.add(token);
-  const signed = signToken(token);
-  res.setHeader('Set-Cookie', `kp_session=${encodeURIComponent(signed)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`);
-  fileLog(`Successful login from ${req.ip}`);
-  res.json({ success: true });
-});
-
-app.post('/api/auth/logout', (req, res) => {
-  const cookies = parseCookies(req);
-  const signed = cookies['kp_session'];
-  if (signed) {
-    const idx = signed.lastIndexOf('.');
-    if (idx !== -1) SESSIONS.delete(signed.slice(0, idx));
-  }
-  res.setHeader('Set-Cookie', 'kp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
-  res.json({ success: true });
-});
-
-app.get('/api/auth/status', (req, res) => {
-  if (!K_PANEL_PASSWORD || K_PANEL_PASSWORD.length === 0) return res.json({ authenticated: true, noAuth: true });
-  const cookies = parseCookies(req);
-  res.json({ authenticated: verifyToken(cookies['kp_session']) });
-});
+app.post('/api/auth/login', (req, res) => loginHandler(req, res, fileLog));
+app.post('/api/auth/logout', (req, res) => logoutHandler(req, res));
+app.get('/api/auth/status', (req, res) => statusHandler(req, res));
 
 // ── Health & Zero Trust ────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ status: 'ok', service: 'kpanel-backend', timestamp: new Date().toISOString() }));
@@ -211,7 +183,7 @@ function getExactMemory() {
 // Background sampling for precise CPU delta
 setInterval(() => {
   calculateCpuUsage();
-}, 2000);
+}, 2000).unref();
 
 app.get('/api/stats', async (req, res) => {
   try {
@@ -2498,7 +2470,7 @@ for (let i = 24; i >= 0; i--) {
     ramPercent: parseFloat(((baseRam / 23.4) * 100).toFixed(1))
   });
 }
-setInterval(recordMetricPoint, 15000);
+setInterval(recordMetricPoint, 15000).unref();
 
 app.get('/api/metrics/history', (req, res) => {
   res.json(METRICS_HISTORY);
@@ -2562,6 +2534,20 @@ app.delete('/api/deployments/:id', (req, res) => {
 });
 
 // ── 15. START SERVER ──────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-  fileLog(`K-Panel started on port ${PORT} | Auth: ${K_PANEL_PASSWORD ? 'enabled' : 'DISABLED'}`);
-});
+if (require.main === module) {
+  try {
+    const { getDatabase } = require('./config/database');
+    const { runMigrations } = require('./db/migrate');
+    const db = getDatabase();
+    const result = runMigrations(db);
+    fileLog(`[DB] SQLite schema verified (version ${result.currentVersion})`);
+  } catch (err) {
+    fileLog(`[DB ERROR] Failed to initialize SQLite database: ${err.message}`);
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    fileLog(`K-Panel started on port ${PORT} | Auth: ${isPasswordConfigured() ? 'enabled' : 'LOCKED (missing K_PANEL_PASSWORD)'}`);
+  });
+}
+
+module.exports = app;

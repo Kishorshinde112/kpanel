@@ -1,17 +1,28 @@
 "use client";
 
-import React, { useState, useEffect } from 'react';
-import { Menu, Bell, Search, User, Server, Bot, Sparkles } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import Link from 'next/link';
+import { Menu, Bell, Search, User, Server, Bot, Sparkles, LogOut, Settings, ShieldCheck } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { useAuth } from '../../context/AuthContext';
 
 export const TopNav: React.FC<{ onMenuClick: () => void; onAiClick?: () => void }> = ({ onMenuClick, onAiClick }) => {
   const [status, setStatus] = useState<'healthy' | 'high_load'>('healthy');
   const [showNotifications, setShowNotifications] = useState(false);
+  const [showUserMenu, setShowUserMenu] = useState(false);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+
+  const { logout } = useAuth();
 
   useEffect(() => {
     const checkStatus = async () => {
       try {
         const res = await fetch('/api/stats');
+        if (res.status === 401) {
+          // Session expired while on dashboard
+          logout();
+          return;
+        }
         if (res.ok) {
           const data = await res.json();
           setStatus(data.status === 'high_load' ? 'high_load' : 'healthy');
@@ -22,6 +33,17 @@ export const TopNav: React.FC<{ onMenuClick: () => void; onAiClick?: () => void 
     checkStatus();
     const interval = setInterval(checkStatus, 10000);
     return () => clearInterval(interval);
+  }, [logout]);
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
+        setShowUserMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
   return (
@@ -78,6 +100,7 @@ export const TopNav: React.FC<{ onMenuClick: () => void; onAiClick?: () => void 
              </span>
           </div>
 
+          {/* Notifications Popover */}
           <div className="relative">
             <button
               onClick={() => setShowNotifications(!showNotifications)}
@@ -101,9 +124,49 @@ export const TopNav: React.FC<{ onMenuClick: () => void; onAiClick?: () => void 
             )}
           </div>
 
-          <button className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10 text-primary hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-            <User className="h-4 w-4" />
-          </button>
+          {/* User Session Menu */}
+          <div className="relative" ref={userMenuRef}>
+            <button
+              onClick={() => setShowUserMenu(!showUserMenu)}
+              className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10 text-primary hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring transition-colors"
+              title="Admin Account & Session"
+            >
+              <User className="h-4 w-4" />
+            </button>
+
+            {showUserMenu && (
+              <div className="absolute right-0 mt-2 w-56 rounded-xl border border-border bg-card p-2 shadow-2xl z-50 animate-in fade-in duration-150 space-y-1">
+                <div className="px-2.5 py-2 border-b border-border/50">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Administrator</span>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mt-0.5">Session Active • 24h Expiry</p>
+                </div>
+
+                <Link
+                  href="/settings"
+                  onClick={() => setShowUserMenu(false)}
+                  className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                >
+                  <Settings className="w-3.5 h-3.5" />
+                  <span>System Settings</span>
+                </Link>
+
+                <button
+                  onClick={() => {
+                    setShowUserMenu(false);
+                    logout();
+                  }}
+                  className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-xs font-medium text-red-400 hover:bg-red-500/10 transition-colors text-left"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span>Log Out</span>
+                </button>
+              </div>
+            )}
+          </div>
+
         </div>
       </div>
     </header>

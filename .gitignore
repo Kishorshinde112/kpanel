@@ -10,7 +10,11 @@ coverage/
 backend/data/*
 !backend/data/.gitkeep
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.sqlite3
 *.pem
 *.key

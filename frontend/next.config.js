@@ -1,4 +1,6 @@
 /** @type {import('next').NextConfig} */
+const backendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:5001';
+
 const nextConfig = {
   // output: 'export',
   images: { unoptimized: true },
@@ -9,7 +11,7 @@ const nextConfig = {
     return [
       {
         source: '/api/:path*',
-        destination: 'http://backend:5001/api/:path*',
+        destination: `${backendUrl}/api/:path*`,
       },
     ];
   },

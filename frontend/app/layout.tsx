@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
+import { Suspense } from "react";
+import { AuthProvider } from "../context/AuthContext";
 import { DashboardLayout } from "../components/layout/DashboardLayout";
 
 const inter = Inter({ subsets: ["latin"] });
@@ -18,9 +20,13 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className={inter.className}>
-        <DashboardLayout>
-          {children}
-        </DashboardLayout>
+        <Suspense fallback={<div className="min-h-screen bg-background" />}>
+          <AuthProvider>
+            <DashboardLayout>
+              {children}
+            </DashboardLayout>
+          </AuthProvider>
+        </Suspense>
       </body>
     </html>
   );
