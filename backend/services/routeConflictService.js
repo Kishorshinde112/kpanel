@@ -225,17 +225,35 @@ function evaluateRouteConflicts(input, topology, options = {}) {
       }
     }
 
-    // Check D: Complex or Unparseable Rule mentioning the domain
-    if (!isMatch && router.isComplex && router.rule.toLowerCase().includes(cleanTargetDomain)) {
-      hasUndetermined = true;
-      conflicts.push({
-        routerName: router.name,
-        provider: router.provider,
-        rule: router.rule,
-        conflictType: 'UNDETERMINED_COMPLEX_RULE',
-        message: `Router "${router.name}" contains complex rule syntax matching target domain that cannot be reliably analyzed.`
-      });
-      continue;
+    // Check D: Non-Host-Restricted / Catch-All Rule or Complex Rule
+    if (!isMatch) {
+      const hasHostRestriction = (router.hostnames && router.hostnames.length > 0) ||
+                                 (router.regexPatterns && router.regexPatterns.length > 0);
+
+      if (router.isComplex && router.rule.toLowerCase().includes(cleanTargetDomain)) {
+        hasUndetermined = true;
+        conflicts.push({
+          routerName: router.name,
+          provider: router.provider,
+          rule: router.rule,
+          conflictType: 'UNDETERMINED_COMPLEX_RULE',
+          message: `Router "${router.name}" contains complex rule syntax matching target domain that cannot be reliably analyzed.`
+        });
+        continue;
+      }
+
+      if (!hasHostRestriction && router.rule && router.rule.trim().length > 0) {
+        // Router on overlapping entrypoint with NO host restriction captures traffic for all domains!
+        hasUndetermined = true;
+        conflicts.push({
+          routerName: router.name,
+          provider: router.provider,
+          rule: router.rule,
+          conflictType: 'UNDETERMINED_CATCH_ALL',
+          message: `Router "${router.name}" lacks host filtering on entrypoint and may intercept traffic for all domains.`
+        });
+        continue;
+      }
     }
 
     if (isMatch) {
