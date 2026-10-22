@@ -6,6 +6,8 @@ const {
   updateApplication,
   ApplicationServiceError
 } = require('../services/applicationService');
+const githubRepositoryService = require('../services/githubRepositoryService');
+const { GithubRepositoryError } = githubRepositoryService;
 const { getDatabase } = require('../config/database');
 const { runMigrations } = require('../db/migrate');
 
@@ -33,12 +35,22 @@ function ensureDatabaseReady() {
  * Maps service-level errors to structured HTTP JSON error responses.
  */
 function sendErrorResponse(res, err) {
-  if (err instanceof ApplicationServiceError) {
+  if (err instanceof ApplicationServiceError || err instanceof GithubRepositoryError) {
     const statusMap = {
       VALIDATION_ERROR: 400,
       APPLICATION_NOT_FOUND: 404,
       DUPLICATE_SLUG: 409,
-      DATABASE_ERROR: 500
+      DATABASE_ERROR: 500,
+      INSTALLATION_NOT_FOUND: 404,
+      INSTALLATION_SUSPENDED: 403,
+      INSTALLATION_NOT_VERIFIED: 403,
+      REPOSITORY_NOT_FOUND: 404,
+      REPOSITORY_NOT_AUTHORIZED: 403,
+      REPOSITORY_ID_MISMATCH: 400,
+      REPOSITORY_IDENTITY_MISMATCH: 400,
+      APPLICATION_REPOSITORY_CHANGED: 409,
+      ASSOCIATION_CONFLICT: 409,
+      GITHUB_API_ERROR: 502
     };
     const statusCode = statusMap[err.code] || 400;
     return res.status(statusCode).json({
@@ -58,6 +70,37 @@ function sendErrorResponse(res, err) {
       message: 'An unexpected internal error occurred.'
     }
   });
+}
+
+/**
+ * CSRF and Origin check middleware for state-changing operations.
+ * Validates that Origin or Referer header matches the host for cookie-authenticated mutation requests.
+ */
+function verifySameOrigin(req, res, next) {
+  const originHeader = req.headers.origin || req.headers.referer;
+  const hostHeader = req.headers.host;
+
+  if (originHeader && hostHeader) {
+    try {
+      const parsedOrigin = new URL(originHeader);
+      if (parsedOrigin.host.toLowerCase() !== hostHeader.toLowerCase()) {
+        return res.status(403).json({
+          error: {
+            code: 'CSRF_REJECTED',
+            message: 'Cross-origin mutation request rejected.'
+          }
+        });
+      }
+    } catch {
+      return res.status(403).json({
+        error: {
+          code: 'CSRF_REJECTED',
+          message: 'Malformed origin header.'
+        }
+      });
+    }
+  }
+  next();
 }
 
 /**
@@ -203,6 +246,149 @@ router.put('/:id', (req, res) => {
 
     return res.json({
       data: updated
+    });
+  } catch (err) {
+    return sendErrorResponse(res, err);
+  }
+});
+
+/**
+ * GET /api/applications/:id/github-repository
+ * Returns verified GitHub repository association metadata for an application.
+ */
+router.get('/:id/github-repository', (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || typeof id !== 'string' || id.trim().length === 0) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Application ID parameter is required.'
+        }
+      });
+    }
+
+    ensureDatabaseReady();
+    const app = getApplicationById(id.trim());
+    if (!app) {
+      return res.status(404).json({
+        error: {
+          code: 'APPLICATION_NOT_FOUND',
+          message: `Application with ID "${id}" was not found.`
+        }
+      });
+    }
+
+    const association = githubRepositoryService.getApplicationRepositoryAssociation(id.trim());
+    if (!association) {
+      return res.status(404).json({
+        error: {
+          code: 'APPLICATION_NOT_FOUND',
+          message: 'No active repository association found for this application.'
+        }
+      });
+    }
+
+    return res.json({
+      data: association
+    });
+  } catch (err) {
+    return sendErrorResponse(res, err);
+  }
+});
+
+/**
+ * POST /api/applications/:id/github-repository
+ * Associates an application with an authorized, verified GitHub App repository.
+ */
+router.post('/:id/github-repository', verifySameOrigin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || typeof id !== 'string' || id.trim().length === 0) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Application ID parameter is required.'
+        }
+      });
+    }
+
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Request body must be a valid JSON object.'
+        }
+      });
+    }
+
+    const { installation_id, repository_id } = req.body;
+    if (!installation_id || !repository_id) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Both installation_id and repository_id are required to associate repository.'
+        }
+      });
+    }
+
+    ensureDatabaseReady();
+    const app = getApplicationById(id.trim());
+    if (!app) {
+      return res.status(404).json({
+        error: {
+          code: 'APPLICATION_NOT_FOUND',
+          message: `Application with ID "${id}" was not found.`
+        }
+      });
+    }
+
+    const association = await githubRepositoryService.associateApplicationRepository({
+      applicationId: id.trim(),
+      installationId: installation_id,
+      repositoryId: repository_id
+    });
+
+    return res.json({
+      data: association
+    });
+  } catch (err) {
+    return sendErrorResponse(res, err);
+  }
+});
+
+/**
+ * DELETE /api/applications/:id/github-repository
+ * Deactivates repository association for an application.
+ */
+router.delete('/:id/github-repository', verifySameOrigin, (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || typeof id !== 'string' || id.trim().length === 0) {
+      return res.status(400).json({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Application ID parameter is required.'
+        }
+      });
+    }
+
+    ensureDatabaseReady();
+    const app = getApplicationById(id.trim());
+    if (!app) {
+      return res.status(404).json({
+        error: {
+          code: 'APPLICATION_NOT_FOUND',
+          message: `Application with ID "${id}" was not found.`
+        }
+      });
+    }
+
+    const unlinked = githubRepositoryService.disconnectApplicationRepository(id.trim());
+    return res.json({
+      success: true,
+      unlinked,
+      message: 'Repository unlinked successfully.'
     });
   } catch (err) {
     return sendErrorResponse(res, err);

@@ -27,6 +27,7 @@ import Link from 'next/link';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '../ui/Card';
 import { GitApplication, ApplicationsListResponse } from '../../types/application';
 import { CreateGitApplicationModal } from './CreateGitApplicationModal';
+import { GitHubConnectionPanel } from './GitHubConnectionPanel';
 
 interface GitApplicationsTabProps {
   onShowToast: (text: string, type?: 'success' | 'error') => void;
@@ -122,6 +123,9 @@ export const GitApplicationsTab: React.FC<GitApplicationsTabProps> = ({ onShowTo
           </button>
         </div>
       </div>
+
+      {/* GitHub App Connection & Onboarding Panel */}
+      <GitHubConnectionPanel onShowToast={onShowToast} />
 
       {/* Error Banner */}
       {error && !loading && (

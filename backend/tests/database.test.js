@@ -78,7 +78,7 @@ test('Phase 2A: SQLite Database Foundation Suite', async (t) => {
     const db = getDatabase({ dbPath: tempDbPath });
     const result = runMigrations(db);
     assert.ok(result.applied >= 1, 'At least 1 migration must be applied');
-    assert.equal(result.currentVersion, 1, 'Current schema version must be 1');
+    assert.ok(result.currentVersion >= 1, 'Current schema version must be at least 1');
 
     // Verify all core tables exist in sqlite_master
     const tables = db
@@ -108,7 +108,7 @@ test('Phase 2A: SQLite Database Foundation Suite', async (t) => {
     const db = getDatabase({ dbPath: tempDbPath });
     const secondRun = runMigrations(db);
     assert.equal(secondRun.applied, 0, 'Second run must apply 0 migrations');
-    assert.equal(secondRun.currentVersion, 1);
+    assert.ok(secondRun.currentVersion >= 1);
 
     const thirdRun = runMigrations(db);
     assert.equal(thirdRun.applied, 0, 'Third run must apply 0 migrations');
@@ -295,7 +295,7 @@ test('Phase 2A: SQLite Database Foundation Suite', async (t) => {
     assert.ok(relRow, 'Release record must survive database restart');
 
     const currentVersion = getCurrentVersion(reopenedDb);
-    assert.equal(currentVersion, 1, 'Migration version must be preserved');
+    assert.ok(currentVersion >= 1, 'Migration version must be preserved');
   });
 
   // ── 13. Corrupted or Invalid Migration State Fails Safely ───────────

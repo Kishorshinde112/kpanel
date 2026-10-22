@@ -21,6 +21,7 @@ import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '../..
 import { GitApplication } from '../../../types/application';
 import { ApplicationOverview } from '../../../components/applications/ApplicationOverview';
 import { ApplicationSettingsForm } from '../../../components/applications/ApplicationSettingsForm';
+import { GitHubRepositoryLinker } from '../../../components/applications/GitHubRepositoryLinker';
 
 export default function ApplicationDetailPage() {
   const params = useParams();
@@ -230,13 +231,19 @@ export default function ApplicationDetailPage() {
 
           {/* Active Tab View */}
           {activeTab === 'overview' ? (
-            <ApplicationOverview application={application} onShowToast={showToast} />
+            <div className="space-y-6">
+              <GitHubRepositoryLinker application={application} onShowToast={showToast} />
+              <ApplicationOverview application={application} onShowToast={showToast} />
+            </div>
           ) : (
-            <ApplicationSettingsForm
-              application={application}
-              onSaveSuccess={handleSaveSuccess}
-              onShowToast={showToast}
-            />
+            <div className="space-y-6">
+              <GitHubRepositoryLinker application={application} onShowToast={showToast} />
+              <ApplicationSettingsForm
+                application={application}
+                onSaveSuccess={handleSaveSuccess}
+                onShowToast={showToast}
+              />
+            </div>
           )}
         </div>
       ) : null}

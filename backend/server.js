@@ -71,7 +71,11 @@ function formatPermissions(mode) {
 // ── Middleware ────────────────────────────────────────────
 app.set('trust proxy', 1);
 app.use(cors({ origin: '*' }));
-app.use('/api/webhook', express.raw({ type: '*/*' }));
+
+// ── Webhook Ingress (Raw byte parser mounted before global express.json and authMiddleware) ──
+const webhooksRouter = require('./routes/webhooks');
+app.use('/api/webhooks', webhooksRouter);
+
 app.use(express.json());
 
 // Handle malformed JSON request bodies gracefully
@@ -99,6 +103,10 @@ app.use((req, res, next) => {
 // ── Application Management Routes (Git Applications) ─────
 const applicationsRouter = require('./routes/applications');
 app.use('/api/applications', applicationsRouter);
+
+// ── GitHub App Management & Onboarding Routes ────────────
+const githubRouter = require('./routes/github');
+app.use('/api/github', githubRouter);
 
 // ── Auth endpoints ────────────────────────────────────────
 app.post('/api/auth/login', (req, res) => loginHandler(req, res, fileLog));

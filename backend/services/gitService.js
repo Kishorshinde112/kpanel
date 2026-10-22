@@ -3,6 +3,10 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const githubAppService = require('./githubAppService');
+const { startCredentialBroker } = require('./gitCredentialBroker');
+
+const ASKPASS_HELPER_PATH = path.resolve(path.join(__dirname, '..', 'helpers', 'gitAskpass.js'));
 
 /**
  * Structured service error class for Git operations.
@@ -171,12 +175,14 @@ function validateRepositoryUrl(rawUrl, options = {}) {
   }
 
   const normalizedUrl = `https://github.com/${owner}/${repo}.git`;
+  const isTestFixture = Boolean(options.allowTestFixture && process.env.NODE_ENV === 'test');
 
   return {
     owner,
     repo,
     normalizedUrl,
-    isHttps: true
+    isHttps: true,
+    isTestFixture
   };
 }
 
@@ -287,15 +293,20 @@ function executeGitCommand(args, options = {}) {
     }, timeout);
 
     // Cancellation support via AbortSignal
+    let onAbort;
     if (options.signal) {
-      options.signal.addEventListener('abort', () => {
+      onAbort = () => {
         if (!isTerminated) {
           isTerminated = true;
           clearTimeout(timer);
           child.kill('SIGTERM');
+          setTimeout(() => {
+            try { child.kill('SIGKILL'); } catch {}
+          }, 3000).unref();
           reject(new GitServiceError('Git operation was cancelled by caller.', 'OPERATION_CANCELLED'));
         }
-      });
+      };
+      options.signal.addEventListener('abort', onAbort, { once: true });
     }
 
     child.stdout.on('data', (chunk) => {
@@ -312,6 +323,9 @@ function executeGitCommand(args, options = {}) {
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      if (options.signal && onAbort) {
+        try { options.signal.removeEventListener('abort', onAbort); } catch {}
+      }
       if (!isTerminated) {
         reject(new GitServiceError(`Failed to spawn Git process: ${err.message}`, 'GIT_FETCH_FAILED'));
       }
@@ -319,6 +333,9 @@ function executeGitCommand(args, options = {}) {
 
     child.on('close', (code, signal) => {
       clearTimeout(timer);
+      if (options.signal && onAbort) {
+        try { options.signal.removeEventListener('abort', onAbort); } catch {}
+      }
       if (isTerminated) return;
 
       resolve({
@@ -412,8 +429,37 @@ async function fetchRepository(application, options = {}) {
     );
   }
 
-  const { normalizedUrl, isTestFixture } = validateRepositoryUrl(repo_url, options);
+  let authMode = options.authMode;
+  let effectiveOptions = { ...options };
+
+  // If authMode is not explicitly provided, attempt to auto-resolve from verified database association
+  if (!authMode && options.autoResolveAuth !== false && applicationId) {
+    try {
+      const githubRepoService = require('./githubRepositoryService');
+      const resolved = githubRepoService.resolveApplicationCheckoutAuth(applicationId, options);
+      if (resolved) {
+        authMode = resolved.authMode;
+        effectiveOptions = { ...effectiveOptions, ...resolved };
+      }
+    } catch (err) {
+      if (err.name === 'GithubRepositoryError' && err.code !== 'APPLICATION_NOT_FOUND') {
+        throw new GitServiceError(err.message, err.code, err.details);
+      }
+    }
+  }
+
+  authMode = authMode || 'public';
+  if (authMode !== 'public' && authMode !== 'github-app') {
+    throw new GitServiceError(`Unsupported authentication mode "${authMode}". Supported modes: "public", "github-app".`, 'UNSUPPORTED_AUTH_METHOD');
+  }
+
+  const repoInfo = validateRepositoryUrl(repo_url, options);
+  const normalizedUrl = repoInfo.normalizedUrl;
+  const isTestFixture = repoInfo.isTestFixture;
   const validatedBranch = validateBranch(branch || 'main');
+
+  let broker = null;
+  const extraEnv = options.extraEnv ? { ...options.extraEnv } : {};
 
   // Resolve and verify workspace root
   const workspaceRoot = getWorkspaceRoot(options.workspaceRoot);
@@ -453,14 +499,96 @@ async function fetchRepository(application, options = {}) {
     throw new GitServiceError('Symlink-based workspace escape detected.', 'WORKSPACE_ACCESS_DENIED');
   }
 
+  // GitHub App Authenticated Mode Setup
+  if (authMode === 'github-app') {
+    // 1. Validate installation ID
+    const instId = effectiveOptions.installationId;
+    if (instId === undefined || instId === null || String(instId).trim().length === 0) {
+      throw new GitServiceError('Installation ID is required for GitHub App authenticated checkout.', 'GITHUB_APP_INVALID_ID');
+    }
+    const instIdStr = String(instId).trim();
+    if (!/^[1-9]\d*$/.test(instIdStr)) {
+      throw new GitServiceError(`Invalid installation ID "${instIdStr}". Expected positive integer.`, 'GITHUB_APP_INVALID_ID');
+    }
+
+    // 2. Validate repository identity mapping
+    if (effectiveOptions.repositoryName && String(effectiveOptions.repositoryName).trim().toLowerCase() !== repoInfo.repo.toLowerCase()) {
+      throw new GitServiceError(
+        `Repository identity mismatch: requested repository "${effectiveOptions.repositoryName}" does not match application repository "${repoInfo.repo}".`,
+        'GITHUB_PERMISSION_DENIED'
+      );
+    }
+    if (effectiveOptions.repositoryOwner && String(effectiveOptions.repositoryOwner).trim().toLowerCase() !== repoInfo.owner.toLowerCase()) {
+      throw new GitServiceError(
+        `Repository owner mismatch: requested owner "${effectiveOptions.repositoryOwner}" does not match application owner "${repoInfo.owner}".`,
+        'GITHUB_PERMISSION_DENIED'
+      );
+    }
+    if (effectiveOptions.repositoryId !== undefined && effectiveOptions.repositoryId !== null) {
+      const repIdNum = Number(effectiveOptions.repositoryId);
+      if (!Number.isInteger(repIdNum) || repIdNum <= 0) {
+        throw new GitServiceError('Invalid repository ID format. Expected positive integer.', 'GITHUB_PERMISSION_DENIED');
+      }
+    }
+
+    // 3. Verify GitHub App configuration exists
+    if (!githubAppService.isGithubAppConfigured(effectiveOptions)) {
+      throw new GitServiceError('GitHub App identity is not configured on this server.', 'GITHUB_APP_NOT_CONFIGURED');
+    }
+
+    // 4. Request short-lived installation access token
+    let tokenResult;
+    try {
+      const tokenOpts = {
+        ...effectiveOptions,
+        repositories: [repoInfo.repo],
+        permissions: { contents: 'read' }
+      };
+      if (effectiveOptions.repositoryId) {
+        tokenOpts.repository_ids = [Number(effectiveOptions.repositoryId)];
+      }
+      tokenResult = await githubAppService.getInstallationAccessToken(instIdStr, tokenOpts);
+    } catch (err) {
+      if (err instanceof githubAppService.GithubAppError) {
+        throw new GitServiceError(err.message, err.code, err.details);
+      }
+      throw new GitServiceError(`Failed to acquire GitHub installation token: ${err.message}`, 'GITHUB_AUTH_FAILED');
+    }
+
+    // 5. Start isolated local Unix-domain socket credential broker
+    try {
+      broker = await startCredentialBroker({
+        token: tokenResult.token,
+        operationId,
+        expectedHost: isTestFixture ? 'localhost' : 'github.com',
+        timeoutMs: options.timeout || 60000
+      });
+    } catch (err) {
+      throw new GitServiceError(`Failed to start local credential broker: ${err.message}`, 'CREDENTIAL_BROKER_ERROR');
+    }
+
+    // Configure askpass environment
+    extraEnv.GIT_ASKPASS = process.execPath;
+    extraEnv.KPANEL_ASKPASS_SOCKET = broker.socketPath;
+    extraEnv.KPANEL_ASKPASS_NONCE = broker.nonce;
+  }
+
   // Prepare shallow clone arguments with security restrictions
   const extraConfig = isTestFixture ? ['-c', 'protocol.file.allow=always'] : ['-c', 'protocol.file.allow=never'];
+  const askpassConfig = broker
+    ? [
+        '-c', `core.askPass=${process.execPath} "${ASKPASS_HELPER_PATH}"`,
+        '-c', 'credential.helper='
+      ]
+    : [];
+
   const cloneArgs = [
     '-c', 'core.hooksPath=/dev/null',          // Disable repository hooks execution
     '-c', 'submodule.recurse=false',           // Disable submodules
     '-c', 'filter.lfs.smudge=',                // Disable Git LFS smudge execution
     '-c', 'filter.lfs.required=false',
     '-c', 'http.followRedirects=false',        // Disable off-domain HTTP redirects
+    ...askpassConfig,
     ...extraConfig,
     'clone',
     '--depth', '1',                            // Shallow clone (depth 1)
@@ -468,21 +596,32 @@ async function fetchRepository(application, options = {}) {
     '--single-branch',                         // Only requested branch
     '--no-tags',                               // Do not download tags
     '--',
-    normalizedUrl,
+    (repoInfo.isTestFixture && options.testFixtureUrl) ? options.testFixtureUrl : normalizedUrl,
     realSourceDir
   ];
 
   try {
     const cloneResult = await executeGitCommand(cloneArgs, {
       timeout: options.timeout || 60000,
-      signal: options.signal
+      signal: options.signal,
+      extraEnv
     });
 
     if (cloneResult.code !== 0) {
       const errText = cloneResult.stderr.toLowerCase();
-      if (errText.includes('repository not found') || errText.includes('could not read username')) {
+      if (errText.includes('could not read username') || errText.includes('authentication failed')) {
         throw new GitServiceError(
-          'Repository was not found or is private. Only public repositories are supported.',
+          authMode === 'github-app'
+            ? 'GitHub App authentication failed for private repository access.'
+            : 'Authentication is required to access this repository. Configure GitHub App credentials.',
+          'GIT_AUTH_REQUIRED'
+        );
+      }
+      if (errText.includes('repository not found')) {
+        throw new GitServiceError(
+          authMode === 'github-app'
+            ? 'Repository was not found or is not accessible by this GitHub App installation.'
+            : 'Repository was not found or is private. Only public repositories are supported without credentials.',
           'REPOSITORY_NOT_FOUND'
         );
       }
@@ -527,6 +666,10 @@ async function fetchRepository(application, options = {}) {
       }
     } catch {}
     throw err;
+  } finally {
+    if (broker) {
+      broker.close();
+    }
   }
 }
 
@@ -595,11 +738,271 @@ function cleanupWorkspace(workspaceInfo, options = {}) {
   };
 }
 
+const COMMIT_SHA_REGEX = /^[0-9a-f]{40}$/i;
+const ZERO_SHA = '0000000000000000000000000000000000000000';
+
+/**
+ * Fetches an exact immutable Git commit into an isolated workspace and checks it out in detached-HEAD mode.
+ * Strictly verifies that the checked-out HEAD SHA matches the requested commit SHA.
+ *
+ * @param {Object} application - Application record containing id, repo_url, and optional branch
+ * @param {string} commitSha - Exact 40-character hexadecimal commit SHA
+ * @param {Object} options - Options (workspaceRoot, timeout, authMode, etc.)
+ * @returns {Promise<Object>} Snapshot metadata containing verified commitSha and workspacePath
+ */
+async function fetchCommit(application, commitSha, options = {}) {
+  if (options.signal && options.signal.aborted) {
+    throw new GitServiceError('Git operation was cancelled by caller.', 'OPERATION_CANCELLED');
+  }
+
+  if (!application || typeof application !== 'object') {
+    throw new GitServiceError('Application object is required.', 'WORKSPACE_ERROR');
+  }
+
+  const { id: applicationId, repo_url, branch } = application;
+
+  if (!applicationId || !UUID_REGEX.test(String(applicationId).trim())) {
+    throw new GitServiceError('Invalid application ID format. Expected a standard UUID.', 'WORKSPACE_ERROR');
+  }
+
+  // Validate commit SHA format strictly
+  if (!commitSha || typeof commitSha !== 'string') {
+    throw new GitServiceError('Commit SHA is required and must be a string.', 'INVALID_COMMIT_SHA');
+  }
+
+  const cleanSha = commitSha.trim().toLowerCase();
+  if (cleanSha === ZERO_SHA || !COMMIT_SHA_REGEX.test(cleanSha)) {
+    throw new GitServiceError(`Invalid or zero commit SHA identifier "${commitSha}".`, 'INVALID_COMMIT_SHA');
+  }
+
+  const repoInfo = validateRepositoryUrl(repo_url, options);
+  const normalizedUrl = repoInfo.normalizedUrl;
+  const isTestFixture = repoInfo.isTestFixture;
+  const targetBranch = branch ? validateBranch(branch) : 'main';
+
+  let authMode = options.authMode;
+  let effectiveOptions = { ...options };
+
+  // If authMode is not explicitly provided, attempt to auto-resolve from verified database association
+  if (!authMode && options.autoResolveAuth !== false && applicationId) {
+    try {
+      const githubRepoService = require('./githubRepositoryService');
+      const resolved = githubRepoService.resolveApplicationCheckoutAuth(applicationId, options);
+      if (resolved) {
+        authMode = resolved.authMode;
+        effectiveOptions = { ...effectiveOptions, ...resolved };
+      }
+    } catch (err) {
+      if (err.name === 'GithubRepositoryError' && err.code !== 'APPLICATION_NOT_FOUND') {
+        throw new GitServiceError(err.message, err.code, err.details);
+      }
+    }
+  }
+
+  authMode = authMode || 'public';
+  if (authMode !== 'public' && authMode !== 'github-app') {
+    throw new GitServiceError(`Unsupported authentication mode "${authMode}".`, 'UNSUPPORTED_AUTH_METHOD');
+  }
+
+  // Resolve and verify workspace root
+  const workspaceRoot = getWorkspaceRoot(options.workspaceRoot);
+  if (!fs.existsSync(workspaceRoot)) {
+    try {
+      fs.mkdirSync(workspaceRoot, { recursive: true, mode: 0o700 });
+    } catch (err) {
+      throw new GitServiceError(`Failed to create workspace root: ${err.message}`, 'WORKSPACE_ERROR');
+    }
+  }
+
+  const resolvedRoot = fs.realpathSync(workspaceRoot);
+  const operationId = crypto.randomUUID();
+
+  // Create isolated directories: <root>/<appId>/<opId>/source
+  const appWorkspaceDir = path.join(resolvedRoot, applicationId);
+  const opWorkspaceDir = path.join(appWorkspaceDir, operationId);
+  const sourceDir = path.join(opWorkspaceDir, 'source');
+
+  if (!sourceDir.startsWith(resolvedRoot + path.sep)) {
+    throw new GitServiceError('Path traversal detected in workspace path calculation.', 'WORKSPACE_ACCESS_DENIED');
+  }
+
+  try {
+    fs.mkdirSync(sourceDir, { recursive: true, mode: 0o700 });
+  } catch (err) {
+    throw new GitServiceError(`Failed to create isolated workspace directory: ${err.message}`, 'WORKSPACE_ERROR');
+  }
+
+  const realSourceDir = fs.realpathSync(sourceDir);
+  if (!realSourceDir.startsWith(resolvedRoot + path.sep)) {
+    try { fs.rmSync(opWorkspaceDir, { recursive: true, force: true }); } catch {}
+    throw new GitServiceError('Symlink-based workspace escape detected.', 'WORKSPACE_ACCESS_DENIED');
+  }
+
+  let broker = null;
+  const extraEnv = options.extraEnv ? { ...options.extraEnv } : {};
+
+  if (authMode === 'github-app') {
+    const instId = effectiveOptions.installationId;
+    if (!instId || !/^[1-9]\d*$/.test(String(instId).trim())) {
+      throw new GitServiceError('Installation ID is required for GitHub App authenticated checkout.', 'GITHUB_APP_INVALID_ID');
+    }
+
+    if (effectiveOptions.repositoryName && String(effectiveOptions.repositoryName).trim().toLowerCase() !== repoInfo.repo.toLowerCase()) {
+      throw new GitServiceError('Repository identity mismatch.', 'GITHUB_PERMISSION_DENIED');
+    }
+
+    if (!githubAppService.isGithubAppConfigured(effectiveOptions)) {
+      throw new GitServiceError('GitHub App identity is not configured on this server.', 'GITHUB_APP_NOT_CONFIGURED');
+    }
+
+    let tokenResult;
+    try {
+      tokenResult = await githubAppService.getInstallationAccessToken(String(instId).trim(), {
+        ...effectiveOptions,
+        repositories: [repoInfo.repo],
+        permissions: { contents: 'read' }
+      });
+    } catch (err) {
+      if (err instanceof githubAppService.GithubAppError) {
+        throw new GitServiceError(err.message, err.code, err.details);
+      }
+      throw new GitServiceError(`Failed to acquire GitHub installation token: ${err.message}`, 'GITHUB_AUTH_FAILED');
+    }
+
+    try {
+      broker = await startCredentialBroker({
+        token: tokenResult.token,
+        operationId,
+        expectedHost: isTestFixture ? 'localhost' : 'github.com',
+        timeoutMs: options.timeout || 60000
+      });
+    } catch (err) {
+      throw new GitServiceError(`Failed to start local credential broker: ${err.message}`, 'CREDENTIAL_BROKER_ERROR');
+    }
+
+    extraEnv.GIT_ASKPASS = process.execPath;
+    extraEnv.KPANEL_ASKPASS_SOCKET = broker.socketPath;
+    extraEnv.KPANEL_ASKPASS_NONCE = broker.nonce;
+  }
+
+  const extraConfig = isTestFixture ? ['-c', 'protocol.file.allow=always'] : ['-c', 'protocol.file.allow=never'];
+  const askpassConfig = broker
+    ? [
+        '-c', `core.askPass=${process.execPath} "${ASKPASS_HELPER_PATH}"`,
+        '-c', 'credential.helper='
+      ]
+    : [];
+
+  const baseGitOptions = [
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'submodule.recurse=false',
+    '-c', 'filter.lfs.smudge=',
+    '-c', 'filter.lfs.required=false',
+    '-c', 'http.followRedirects=false',
+    ...askpassConfig,
+    ...extraConfig
+  ];
+
+  try {
+    // 1. Initialize empty git repository in target directory
+    await executeGitCommand([...baseGitOptions, 'init', '-q', realSourceDir], {
+      timeout: 10000,
+      signal: options.signal,
+      extraEnv
+    });
+
+    // 2. Add remote origin
+    const targetUrl = (repoInfo.isTestFixture && options.testFixtureUrl) ? options.testFixtureUrl : normalizedUrl;
+    await executeGitCommand([...baseGitOptions, '-C', realSourceDir, 'remote', 'add', 'origin', targetUrl], {
+      timeout: 10000,
+      signal: options.signal,
+      extraEnv
+    });
+
+    // 3. Fetch: Attempt exact commit fetch first
+    let fetchSuccess = false;
+    const fetchCommitResult = await executeGitCommand(
+      [...baseGitOptions, '-C', realSourceDir, 'fetch', '--depth', '1', 'origin', cleanSha],
+      { timeout: options.timeout || 60000, signal: options.signal, extraEnv }
+    );
+
+    if (fetchCommitResult.code === 0) {
+      fetchSuccess = true;
+    } else {
+      // Fallback: If remote forbids direct SHA fetch, fetch branch depth 50 to look for commit
+      const fetchBranchResult = await executeGitCommand(
+        [...baseGitOptions, '-C', realSourceDir, 'fetch', '--depth', '50', 'origin', targetBranch],
+        { timeout: options.timeout || 60000, signal: options.signal, extraEnv }
+      );
+      if (fetchBranchResult.code === 0) {
+        fetchSuccess = true;
+      }
+    }
+
+    if (!fetchSuccess) {
+      throw new GitServiceError(`The requested commit "${cleanSha}" is unavailable in repository "${normalizedUrl}".`, 'GIT_COMMIT_UNAVAILABLE');
+    }
+
+    // 4. Verify the Git object exists and is a commit object
+    const catResult = await executeGitCommand(
+      [...baseGitOptions, '-C', realSourceDir, 'cat-file', '-e', `${cleanSha}^{commit}`],
+      { timeout: 5000, signal: options.signal, extraEnv }
+    );
+
+    if (catResult.code !== 0) {
+      throw new GitServiceError(`The requested commit "${cleanSha}" is unavailable in repository "${normalizedUrl}".`, 'GIT_COMMIT_UNAVAILABLE');
+    }
+
+    // 5. Check out exact commit in detached-HEAD mode
+    const checkoutResult = await executeGitCommand(
+      [...baseGitOptions, '-C', realSourceDir, 'checkout', '-q', '--detach', cleanSha],
+      { timeout: 15000, signal: options.signal, extraEnv }
+    );
+
+    if (checkoutResult.code !== 0) {
+      throw new GitServiceError(`Failed to checkout commit "${cleanSha}": ${checkoutResult.stderr}`, 'GIT_FETCH_FAILED');
+    }
+
+    // 6. Verify local checkout HEAD equals requested commitSha
+    const revParseResult = await executeGitCommand(
+      ['-C', realSourceDir, 'rev-parse', 'HEAD'],
+      { timeout: 5000, signal: options.signal, extraEnv }
+    );
+
+    const verifiedSha = revParseResult.stdout.trim().toLowerCase();
+    if (verifiedSha !== cleanSha) {
+      throw new GitServiceError('Checked-out commit SHA does not match requested commit.', 'GIT_COMMIT_MISMATCH');
+    }
+
+    return {
+      operationId,
+      applicationId,
+      workspacePath: realSourceDir,
+      commitSha: verifiedSha,
+      branch: targetBranch,
+      repository: normalizedUrl,
+      fetchedAt: new Date().toISOString()
+    };
+  } catch (err) {
+    try {
+      if (fs.existsSync(opWorkspaceDir)) {
+        fs.rmSync(opWorkspaceDir, { recursive: true, force: true });
+      }
+    } catch {}
+    throw err;
+  } finally {
+    if (broker) {
+      broker.close();
+    }
+  }
+}
+
 module.exports = {
   validateRepositoryUrl,
   validateBranch,
   inspectRemoteBranch,
   fetchRepository,
+  fetchCommit,
   cleanupWorkspace,
   getWorkspaceRoot,
   executeGitCommand,
