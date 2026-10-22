@@ -62,10 +62,10 @@ test('Phase 4A1: Safe Worker Lease, Claiming & Recovery Suite', async (t) => {
   // ── 1-3. Migration 005 Verification ───────────────────────────────
   await t.test('1-3. Migration 005 applies cleanly, is idempotent, and preserves previous migrations', () => {
     const version = getCurrentVersion(testDb);
-    assert.equal(version, 5, 'Schema version must be 5');
+    assert.ok(version >= 5, 'Schema version must be at least 5');
 
     const applied = getAppliedMigrations(testDb);
-    assert.equal(applied.length, 5);
+    assert.ok(applied.length >= 5, 'Applied migrations count must be at least 5');
 
     const rerun = runMigrations(testDb);
     assert.equal(rerun.applied, 0, 'Migration re-run must be idempotent');

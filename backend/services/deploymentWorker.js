@@ -6,6 +6,7 @@ const deploymentQueueService = require('./deploymentQueueService');
 const gitService = require('./gitService');
 const githubRepositoryService = require('./githubRepositoryService');
 const githubAppService = require('./githubAppService');
+const buildService = require('./buildService');
 
 /**
  * Structured service error class for Deployment Worker operations.
@@ -286,12 +287,152 @@ async function runOnce(options = {}) {
       );
     }
 
-    // 9. Prepare-Only Mode Cleanup: Clean up temporary source workspace
-    // In Phase 4A2, no Docker build or container launch occurs.
+    // 9. Dual build-execution authorization gate (Phase 4B2H Hardening)
+    // Both caller option (options.executeBuild === true) AND environment variable
+    // (process.env.KPANEL_BUILD_EXECUTION_ENABLED === 'true') must be explicitly set.
+    const isEnvBuildEnabled = process.env.KPANEL_BUILD_EXECUTION_ENABLED === 'true';
+    const isCallerBuildRequested = options.executeBuild === true;
+    const canExecuteBuild = isCallerBuildRequested && isEnvBuildEnabled;
+
+    if (!canExecuteBuild) {
+      // Prepare-Only Mode: Clean up temporary source workspace and release claim
+      // Bounded retry count (claim_attempts) is preserved via releasePrepareOnlyClaim
+      gitService.cleanupWorkspace(snapshot, options);
+      deploymentLeaseService.releasePrepareOnlyClaim(claimedJob.id, workerId, fencingToken, { db });
+      activeClaimedDeploymentId = null;
+
+      const buildRefused = isCallerBuildRequested && !isEnvBuildEnabled;
+
+      return {
+        executed: true,
+        deploymentId: claimedJob.id,
+        applicationId: validatedApp.id,
+        applicationName: validatedApp.name,
+        commitSha: claimedJob.commitSha,
+        branch: targetBranch,
+        prepared: true,
+        buildExecutionEnabled: false,
+        buildRefused,
+        status: 'queued',
+        workerId,
+        fencingToken,
+        message: buildRefused
+          ? 'Build execution refused: KPANEL_BUILD_EXECUTION_ENABLED environment variable is not enabled.'
+          : 'Exact commit source prepared and verified successfully in prepare-only mode.'
+      };
+    }
+
+    // 10. Fenced Build Execution Path (Phase 4B2)
+    // Atomically transition status from 'queued' to 'building' under the global lease
+    try {
+      deploymentLeaseService.recordDeploymentBuilding(claimedJob.id, workerId, fencingToken, { db });
+    } catch (stateErr) {
+      gitService.cleanupWorkspace(snapshot, options);
+      deploymentLeaseService.releaseDeploymentClaim(claimedJob.id, workerId, fencingToken, { db });
+      activeClaimedDeploymentId = null;
+      throw stateErr;
+    }
+
+    const normalizedBuildPath = (validatedApp.build_path && validatedApp.build_path !== '/')
+      ? validatedApp.build_path.replace(/^\/+/, '')
+      : '.';
+
+    const buildInput = {
+      deploymentId: claimedJob.id,
+      applicationId: validatedApp.id,
+      commitSha: claimedJob.commitSha,
+      workspacePath: snapshot.workspacePath,
+      buildType: validatedApp.build_type || 'dockerfile'
+    };
+
+    const buildOptions = {
+      buildPath: options.buildPath || normalizedBuildPath,
+      dockerfilePath: options.dockerfilePath,
+      platform: options.platform || 'linux/arm64',
+      timeout: options.buildTimeout || 600000,
+      signal: abortController.signal,
+      workspaceRoot: options.workspaceRoot,
+      logRoot: options.logRoot,
+      spawn: options.spawn,
+      execFile: options.execFile,
+      dockerBinary: options.dockerBinary,
+      skipDaemonCheck: options.skipDaemonCheck,
+      skipGitHeadCheck: options.skipGitHeadCheck,
+      allowOverwrite: options.allowOverwrite
+    };
+
+    let buildResult;
+    try {
+      buildResult = await buildService.buildImage(buildInput, buildOptions);
+    } catch (buildErr) {
+      // Clean up workspace on failure
+      gitService.cleanupWorkspace(snapshot, options);
+
+      // Check if lease was lost during build
+      if (leaseLost || buildErr.code === 'LEASE_LOST') {
+        activeClaimedDeploymentId = null;
+        throw new DeploymentWorkerError('Worker lost lease or fencing token during build.', 'LEASE_LOST');
+      }
+
+      // Record failure in database under fencing token
+      try {
+        deploymentLeaseService.recordDeploymentFailed(
+          claimedJob.id,
+          workerId,
+          fencingToken,
+          buildErr.message,
+          buildErr.logPath || null,
+          { db }
+        );
+      } catch (recordErr) {
+        console.error('[Worker Record Failure Warning]', recordErr.message);
+      }
+      activeClaimedDeploymentId = null;
+
+      if (options.signal && options.signal.aborted && buildErr.code === 'OPERATION_CANCELLED') {
+        throw new DeploymentWorkerError('Worker build was cancelled by caller.', 'OPERATION_CANCELLED');
+      }
+
+      throw buildErr;
+    }
+
+    // Clean up temporary workspace after successful image build
     gitService.cleanupWorkspace(snapshot, options);
 
-    // Release prepare-only claim: restores claim_attempts so verification runs do not exhaust retry limits
-    deploymentLeaseService.releasePrepareOnlyClaim(claimedJob.id, workerId, fencingToken, { db });
+    // Verify lease and fencing token one final time before committing state
+    const finalLock = db.prepare(`
+      SELECT owner_id, fencing_token,
+             CAST(strftime('%s', 'now') AS INTEGER) as now_epoch,
+             CAST(strftime('%s', lease_expires_at) AS INTEGER) as exp_epoch
+      FROM deployment_worker_lock
+      WHERE lock_name = ?
+    `).get(deploymentLeaseService.GLOBAL_LOCK_NAME);
+
+    const isFinalLeaseActive = finalLock &&
+      finalLock.owner_id === workerId &&
+      Number(finalLock.fencing_token) === Number(fencingToken) &&
+      finalLock.now_epoch < finalLock.exp_epoch;
+
+    if (!isFinalLeaseActive || leaseLost) {
+      activeClaimedDeploymentId = null;
+      throw new DeploymentWorkerError('Worker lost lease before committing built status.', 'LEASE_LOST');
+    }
+
+    // Atomically transition status to 'built' and persist durable build artifacts
+    const artifactData = {
+      applicationId: validatedApp.id,
+      commitSha: claimedJob.commitSha,
+      imageTag: buildResult.imageTag,
+      imageId: buildResult.imageId,
+      buildDurationMs: buildResult.buildDurationMs,
+      logPath: buildResult.logPath,
+      platform: buildResult.metadata?.platform || 'linux/arm64',
+      buildType: buildResult.metadata?.buildType || 'dockerfile',
+      buildPath: buildResult.metadata?.buildPath || normalizedBuildPath,
+      dockerfilePath: buildResult.metadata?.dockerfilePath || 'Dockerfile'
+    };
+
+    deploymentLeaseService.recordDeploymentBuilt(claimedJob.id, workerId, fencingToken, artifactData, { db });
     activeClaimedDeploymentId = null;
 
     return {
@@ -301,11 +442,14 @@ async function runOnce(options = {}) {
       applicationName: validatedApp.name,
       commitSha: claimedJob.commitSha,
       branch: targetBranch,
-      prepared: true,
-      status: 'queued',
+      status: 'built',
+      imageTag: buildResult.imageTag,
+      imageId: buildResult.imageId,
+      buildDurationMs: buildResult.buildDurationMs,
+      logPath: buildResult.logPath,
       workerId,
       fencingToken,
-      message: 'Exact commit source prepared and verified successfully in prepare-only mode.'
+      message: 'Docker BuildKit image built successfully and durable artifacts recorded. Container launch deferred.'
     };
   } finally {
     if (options.signal && callerAbortListener) {
@@ -331,8 +475,16 @@ async function runOnce(options = {}) {
   }
 }
 
+/**
+ * Returns true if server-side build execution is enabled via environment variable.
+ */
+function isBuildExecutionEnabled() {
+  return process.env.KPANEL_BUILD_EXECUTION_ENABLED === 'true';
+}
+
 module.exports = {
   runOnce,
   validateWorkerSourceAuthorization,
+  isBuildExecutionEnabled,
   DeploymentWorkerError
 };
