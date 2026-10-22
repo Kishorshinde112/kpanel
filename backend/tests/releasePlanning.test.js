@@ -832,7 +832,7 @@ test('Phase 4C2: Release Planning & Traefik Routing Preparation Suite', async (t
 
     const plan = await createReleasePlan(
       { deploymentId, applicationId: app.id },
-      { db: testDb, docker: mockDocker, skipGitCheck: true }
+      { db: testDb, docker: mockDocker, skipGitCheck: true, trustedOperator: true }
     );
 
     assert.equal(plan.planStatus, 'ready');
@@ -921,14 +921,14 @@ test('Phase 4C2: Release Planning & Traefik Routing Preparation Suite', async (t
     assert.equal(freshCancelled.reason, 'DEPLOYMENT_CANCELLED');
 
     // 28. Plan cancellation scoped to application
-    const cancelRes = cancelReleasePlan(plan.planId, 'OPERATOR_CANCELLED', { db: testDb, applicationId: app.id });
+    const cancelRes = cancelReleasePlan(plan.planId, 'OPERATOR_CANCELLED', { db: testDb, applicationId: app.id, trustedOperator: true });
     assert.equal(cancelRes.cancelled, true);
     assert.equal(getReleasePlan(plan.planId, { db: testDb }).plan_status, 'cancelled');
 
     // Cross-application cancellation rejected
     await assert.rejects(
       async () => {
-        cancelReleasePlan(plan.planId, 'ATTACK', { db: testDb, applicationId: 'foreign-app-id' });
+        cancelReleasePlan(plan.planId, 'ATTACK', { db: testDb, applicationId: 'foreign-app-id', trustedOperator: true });
       },
       (err) => err instanceof ReleasePlanningError && err.code === 'APPLICATION_ID_MISMATCH'
     );

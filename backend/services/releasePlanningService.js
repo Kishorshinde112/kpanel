@@ -369,6 +369,41 @@ async function validateReleaseEligibility(deploymentId, options = {}) {
 }
 
 /**
+ * Verifies explicit authorization context for release planning state mutations.
+ * Strictly prevents unauthenticated callers from bypassing fencing checks.
+ * Requires either:
+ * 1. Explicit trusted operator authorization: options.trustedOperator === true
+ * 2. Active worker execution lease with matching ownerId and fencingToken verified in SQLite
+ *
+ * @param {Object} options - Caller options
+ * @param {Object} [input] - Operation input (ownerId/fencingToken fallback)
+ * @param {Object} db - Database instance
+ * @returns {Object} { authorized: true, mode: 'trusted-operator' | 'worker', ownerId?: string, fencingToken?: number }
+ */
+function verifyReleasePlanningAuthorization(options = {}, input = {}, db) {
+  // Mode 1: Explicit trusted operator authorization (e.g. from internal administrative controller)
+  // Input parameters can NEVER set trustedOperator (strictly read from options)
+  if (options.trustedOperator === true) {
+    return { authorized: true, mode: 'trusted-operator' };
+  }
+
+  // Mode 2: Worker-driven execution lease and monotonic fencing token
+  const cleanOwnerId = String(options.ownerId || input.ownerId || '').trim();
+  const tokenNum = parseInt(options.fencingToken !== undefined ? options.fencingToken : input.fencingToken, 10);
+
+  if (!cleanOwnerId || isNaN(tokenNum)) {
+    throw new ReleasePlanningError(
+      'Authorization context is required to modify release plans: caller must provide valid worker lease credentials (ownerId and fencingToken) or explicit trustedOperator authorization.',
+      'UNAUTHORIZED_MUTATION'
+    );
+  }
+
+  // Strictly verify against SQLite global worker lease and monotonic fencing token
+  runtimeService.verifyActiveWorkerLease(cleanOwnerId, tokenNum, db);
+  return { authorized: true, mode: 'worker', ownerId: cleanOwnerId, fencingToken: tokenNum };
+}
+
+/**
  * Creates or reconciles a durable release plan for a verified built candidate.
  * Guarantees atomic transaction execution, fencing token validation, deterministic route proposal,
  * and enforcement of single actionable plan per application.
@@ -390,12 +425,8 @@ async function createReleasePlan(input, options = {}) {
   const db = options.db || getDatabase(options);
   const cleanDeploymentId = deploymentId.trim();
 
-  // 1. Worker Lease and Fencing Token Verification (where worker execution is involved)
-  const cleanOwnerId = String(options.ownerId || input.ownerId || '').trim();
-  const tokenNum = parseInt(options.fencingToken !== undefined ? options.fencingToken : input.fencingToken, 10);
-  if (cleanOwnerId && !isNaN(tokenNum)) {
-    runtimeService.verifyActiveWorkerLease(cleanOwnerId, tokenNum, db);
-  }
+  // 1. Mandatory Authorization Context Verification (Worker lease or trusted operator)
+  const auth = verifyReleasePlanningAuthorization(options, input, db);
 
   // 2. Validate Complete Release Eligibility (including fresh Docker health inspection)
   const eligibility = await validateReleaseEligibility(cleanDeploymentId, {
@@ -415,9 +446,9 @@ async function createReleasePlan(input, options = {}) {
 
   // 4. Atomically Persist Release Plan to SQLite
   const planTx = db.transaction(() => {
-    // Re-verify worker lease inside transaction if fenced
-    if (cleanOwnerId && !isNaN(tokenNum)) {
-      runtimeService.verifyActiveWorkerLease(cleanOwnerId, tokenNum, db);
+    // Re-verify worker lease inside transaction if worker-driven
+    if (auth.mode === 'worker') {
+      runtimeService.verifyActiveWorkerLease(auth.ownerId, auth.fencingToken, db);
     }
 
     // Check for existing plan for this exact deployment (Idempotency)
@@ -732,19 +763,30 @@ function invalidateReleasePlan(planId, reason, options = {}) {
   const cleanPlanId = planId.trim();
   const cleanReason = String(reason || 'MANUALLY_INVALIDATED').slice(0, 500);
 
-  const result = db.prepare(`
-    UPDATE deployment_release_plans
-    SET plan_status = 'stale',
-        invalidated_reason = ?,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(cleanReason, cleanPlanId);
+  // Mandatory Authorization Context Verification (Worker lease or trusted operator)
+  const auth = verifyReleasePlanningAuthorization(options, {}, db);
 
-  return {
-    invalidated: result.changes > 0,
-    planId: cleanPlanId,
-    reason: cleanReason
-  };
+  const tx = db.transaction(() => {
+    if (auth.mode === 'worker') {
+      runtimeService.verifyActiveWorkerLease(auth.ownerId, auth.fencingToken, db);
+    }
+
+    const result = db.prepare(`
+      UPDATE deployment_release_plans
+      SET plan_status = 'stale',
+          invalidated_reason = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(cleanReason, cleanPlanId);
+
+    return {
+      invalidated: result.changes > 0,
+      planId: cleanPlanId,
+      reason: cleanReason
+    };
+  });
+
+  return tx.immediate();
 }
 
 /**
@@ -752,7 +794,7 @@ function invalidateReleasePlan(planId, reason, options = {}) {
  *
  * @param {string} planId - Release Plan UUID
  * @param {string} reason - Cancellation reason
- * @param {Object} [options] - Options ({ db, applicationId })
+ * @param {Object} [options] - Options ({ db, applicationId, ownerId, fencingToken, trustedOperator })
  * @returns {Object} Cancellation result
  */
 function cancelReleasePlan(planId, reason, options = {}) {
@@ -764,6 +806,9 @@ function cancelReleasePlan(planId, reason, options = {}) {
   const cleanPlanId = planId.trim();
   const cleanReason = String(reason || 'PLAN_CANCELLED').slice(0, 500);
 
+  // Mandatory Authorization Context Verification (Worker lease or trusted operator)
+  const auth = verifyReleasePlanningAuthorization(options, {}, db);
+
   const plan = db.prepare('SELECT * FROM deployment_release_plans WHERE id = ?').get(cleanPlanId);
   if (!plan) {
     throw new ReleasePlanningError(`Release plan "${cleanPlanId}" not found.`, 'PLAN_NOT_FOUND');
@@ -774,23 +819,32 @@ function cancelReleasePlan(planId, reason, options = {}) {
     throw new ReleasePlanningError('Release plan does not belong to the specified application.', 'APPLICATION_ID_MISMATCH');
   }
 
-  db.prepare(`
-    UPDATE deployment_release_plans
-    SET plan_status = 'cancelled',
-        invalidated_reason = ?,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
-  `).run(cleanReason, cleanPlanId);
+  const tx = db.transaction(() => {
+    if (auth.mode === 'worker') {
+      runtimeService.verifyActiveWorkerLease(auth.ownerId, auth.fencingToken, db);
+    }
 
-  return {
-    cancelled: true,
-    planId: cleanPlanId,
-    applicationId: plan.application_id,
-    reason: cleanReason
-  };
+    db.prepare(`
+      UPDATE deployment_release_plans
+      SET plan_status = 'cancelled',
+          invalidated_reason = ?,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(cleanReason, cleanPlanId);
+
+    return {
+      cancelled: true,
+      planId: cleanPlanId,
+      applicationId: plan.application_id,
+      reason: cleanReason
+    };
+  });
+
+  return tx.immediate();
 }
 
 module.exports = {
+  verifyReleasePlanningAuthorization,
   normalizeAndValidateDomain,
   validateTargetPort,
   validateReleaseEligibility,
