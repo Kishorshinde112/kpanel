@@ -22,3 +22,8 @@ backend/data/*
 *.jpg
 *.mp4
 *.zip
+*.tsbuildinfo
+*inventory*.json
+*-inventory.json
+inventory/
+backend/data/inventory/

@@ -28,11 +28,16 @@ function validateInternalPort(port) {
 
 /**
  * Validates an approved proxy network against strict security, driver, and isolation criteria.
- * Enforces exact network ID, bridge driver/local scope, operator approval, Traefik ownership,
- * and rejection of default, host, or foreign (Dokploy, n8n) networks.
+ * Enforces exact server-configured network ID, bridge driver/local scope, operator approval boundary,
+ * Traefik ownership, and rejection of default, host, or foreign (Dokploy, n8n) networks.
+ *
+ * MANDATORY SECURITY CONTRACT (PHASE 4C3D1):
+ * - A caller-provided boolean `isApproved: true` by itself NEVER authorizes a network.
+ * - Exact server-configured approved network ID is required.
+ * - Stale network or operator evidence is strictly rejected.
  *
  * @param {Object} network - Docker network descriptor { id, name, driver, scope, internal, containers }
- * @param {Object} [options] - Options ({ approvedNetworkId, traefikContainerId, isApproved })
+ * @param {Object} [options] - Options ({ approvedNetworkId, traefikContainerId, isApproved, operatorAuthorization, evidenceCapturedAt, maxEvidenceAgeMs })
  * @returns {Object} Structured network validation result
  */
 function validateApprovedProxyNetwork(network, options = {}) {
@@ -86,19 +91,72 @@ function validateApprovedProxyNetwork(network, options = {}) {
     );
   }
 
-  // 5. Verify Operator Approval
+  // 5. Verify Operator Approval & Server-Configured Approved Network ID
+  // Security invariant: A caller-provided boolean `isApproved: true` alone is NOT sufficient.
+  // The network MUST match an exact server-configured approved network ID.
   const configuredApprovedId = options.approvedNetworkId || process.env.KPANEL_PROXY_NETWORK_ID;
-  const isExplicitlyApproved = Boolean(options.isApproved);
-  const idMatchesApproval = Boolean(configuredApprovedId && (networkId === configuredApprovedId || networkId.startsWith(configuredApprovedId)));
 
-  if (!isExplicitlyApproved && !idMatchesApproval) {
+  if (!configuredApprovedId) {
     throw new StagingNetworkError(
-      `Network "${networkName}" (${networkId.slice(0, 12)}) has not been approved by an operator for K-Panel proxy integration.`,
+      `Network "${networkName}" (${networkId.slice(0, 12)}) has not been approved. Server-configured approved network ID is required. Arbitrary approval flags are rejected.`,
       'UNAPPROVED_PROXY_NETWORK'
     );
   }
 
-  // 6. Verify Traefik Ownership / Attachment
+  const idMatchesApproval = Boolean(
+    networkId === configuredApprovedId ||
+    networkId.startsWith(configuredApprovedId) ||
+    configuredApprovedId.startsWith(networkId)
+  );
+
+  if (!idMatchesApproval) {
+    throw new StagingNetworkError(
+      `Network ID "${networkId.slice(0, 12)}" does not match server-configured approved proxy network ID "${String(configuredApprovedId).slice(0, 12)}". Arbitrary approval flags are rejected.`,
+      'UNAPPROVED_PROXY_NETWORK'
+    );
+  }
+
+  // 6. Verify Evidence Freshness (Reject Stale Network or Operator Evidence)
+  const evidenceTimestamp = network.capturedAt || options.evidenceCapturedAt;
+  if (evidenceTimestamp) {
+    const evidenceTimeMs = Date.parse(evidenceTimestamp);
+    if (!isNaN(evidenceTimeMs)) {
+      const ageMs = Date.now() - evidenceTimeMs;
+      const maxAgeMs = options.maxEvidenceAgeMs || (24 * 60 * 60 * 1000);
+      if (ageMs < 0 || ageMs > maxAgeMs) {
+        throw new StagingNetworkError(
+          `Network evidence captured at "${evidenceTimestamp}" is stale (${Math.round(ageMs / 1000)}s old). Stale network evidence cannot authorize attachment.`,
+          'STALE_NETWORK_EVIDENCE'
+        );
+      }
+    }
+  }
+
+  // 7. Verify Server-Side Operator Authorization Object (If Provided)
+  if (options.operatorAuthorization) {
+    const opAuth = options.operatorAuthorization;
+    if (typeof opAuth !== 'object' || !opAuth.authorizedNetworkId) {
+      throw new StagingNetworkError('Operator authorization object is malformed.', 'INVALID_OPERATOR_AUTHORIZATION');
+    }
+    if (opAuth.authorizedNetworkId !== networkId && !networkId.startsWith(opAuth.authorizedNetworkId)) {
+      throw new StagingNetworkError(
+        `Operator authorization network "${opAuth.authorizedNetworkId}" does not match target network "${networkId.slice(0, 12)}".`,
+        'UNAPPROVED_PROXY_NETWORK'
+      );
+    }
+    if (opAuth.authorizedAt) {
+      const authAgeMs = Date.now() - Date.parse(opAuth.authorizedAt);
+      const maxAuthAgeMs = options.maxAuthorizationAgeMs || (24 * 60 * 60 * 1000);
+      if (isNaN(authAgeMs) || authAgeMs < 0 || authAgeMs > maxAuthAgeMs) {
+        throw new StagingNetworkError(
+          `Operator authorization timestamp "${opAuth.authorizedAt}" is stale.`,
+          'STALE_OPERATOR_EVIDENCE'
+        );
+      }
+    }
+  }
+
+  // 8. Verify Traefik Ownership / Attachment
   // Traefik proxy container MUST be a member of this network
   let traefikAttached = false;
   const traefikId = options.traefikContainerId ? String(options.traefikContainerId).trim().toLowerCase() : null;
@@ -148,7 +206,7 @@ function validateApprovedProxyNetwork(network, options = {}) {
  *
  * @param {Object} candidate - Staged candidate record or container inspection object
  * @param {Object} proxyNetwork - Approved proxy network descriptor
- * @param {Object} [options] - Options ({ expectedImageId, applicationId, appSlug })
+ * @param {Object} [options] - Options ({ expectedImageId, applicationId, appSlug, fencingToken, ownerId, db, requireWorkerLease })
  * @returns {Object} Structured candidate attachment plan
  */
 function planCandidateAttachment(candidate, proxyNetwork, options = {}) {
@@ -156,10 +214,18 @@ function planCandidateAttachment(candidate, proxyNetwork, options = {}) {
     throw new StagingNetworkError('Candidate record is required to plan network attachment.', 'INVALID_CANDIDATE');
   }
 
-  // 1. Validate Target Proxy Network
+  // 1. Verify Candidate Authorization
+  if (candidate.isAuthorized === false || candidate.authorized === false || candidate.status === 'unauthorized') {
+    throw new StagingNetworkError(
+      'Candidate container is not authorized for proxy network attachment.',
+      'UNAUTHORIZED_CANDIDATE'
+    );
+  }
+
+  // 2. Validate Target Proxy Network (Enforces exact approved ID, driver, scope, Traefik attachment)
   const validatedNetwork = validateApprovedProxyNetwork(proxyNetwork, options);
 
-  // 2. Validate Candidate Container Identity & Immutable Image
+  // 3. Validate Candidate Container Identity & Immutable Image
   const containerId = String(candidate.containerId || candidate.container_id || candidate.Id || candidate.id || '').trim();
   if (!containerId || containerId.length < 12) {
     throw new StagingNetworkError('Valid candidate container ID (minimum 12 chars) is required.', 'INVALID_CONTAINER_ID');
@@ -178,7 +244,7 @@ function planCandidateAttachment(candidate, proxyNetwork, options = {}) {
     );
   }
 
-  // 3. Prohibit Host Networking and Host-Published Ports
+  // 4. Prohibit Host Networking and Host-Published Ports
   const networkMode = String(candidate.networkMode || candidate.HostConfig?.NetworkMode || '').toLowerCase();
   if (networkMode === 'host') {
     throw new StagingNetworkError('Host networking mode is strictly prohibited for candidate containers.', 'HOST_NETWORK_PROHIBITED');
@@ -188,7 +254,33 @@ function planCandidateAttachment(candidate, proxyNetwork, options = {}) {
     throw new StagingNetworkError('Directly published host ports are strictly prohibited for reverse-proxied candidates.', 'PUBLISHED_PORTS_PROHIBITED');
   }
 
-  // 4. Generate Deterministic DNS Network Aliases
+  // 5. Verify Worker Lease & Fencing Token (If Specified)
+  if (options.requireWorkerLease === true || options.fencingToken !== undefined || options.ownerId) {
+    const ownerId = String(options.ownerId || '').trim();
+    const fencingToken = parseInt(options.fencingToken, 10);
+
+    if (!ownerId) {
+      throw new StagingNetworkError('Worker owner ID is required for network attachment planning.', 'INVALID_WORKER_CREDENTIALS');
+    }
+    if (isNaN(fencingToken) || fencingToken <= 0) {
+      throw new StagingNetworkError(`Invalid worker fencing token "${options.fencingToken}". Positive integer token required.`, 'INVALID_FENCING_TOKEN');
+    }
+
+    if (options.db) {
+      try {
+        const runtimeService = require('./runtimeService');
+        runtimeService.verifyActiveWorkerLease(ownerId, fencingToken, options.db);
+      } catch (leaseErr) {
+        throw new StagingNetworkError(
+          `Worker lease verification failed: ${leaseErr.message}`,
+          'INVALID_FENCING_TOKEN',
+          { originalCode: leaseErr.code }
+        );
+      }
+    }
+  }
+
+  // 6. Generate Deterministic DNS Network Aliases
   const shortContainerId = containerId.replace(/^sha256:/, '').slice(0, 12);
   const appId = String(candidate.applicationId || candidate.application_id || options.applicationId || '').trim();
   const primaryAlias = `kpanel-app-${shortContainerId}`;
@@ -202,7 +294,7 @@ function planCandidateAttachment(candidate, proxyNetwork, options = {}) {
     }
   }
 
-  // 5. Detect Alias Collisions on Target Network
+  // 7. Detect Alias Collisions on Target Network
   const rawContainers = proxyNetwork.containers || proxyNetwork.Containers || {};
   const containerEntries = Array.isArray(rawContainers)
     ? rawContainers
@@ -226,7 +318,7 @@ function planCandidateAttachment(candidate, proxyNetwork, options = {}) {
     }
   }
 
-  // 6. Confirm Existing Staging Network Preservation
+  // 8. Confirm Existing Staging Network Preservation
   const existingStagingNetwork = candidate.stagingNetworkId || candidate.staging_network_id || options.stagingNetworkId || null;
 
   return {

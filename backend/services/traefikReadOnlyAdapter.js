@@ -40,15 +40,31 @@ function validateTrustedInternalApiUrl(urlStr) {
     throw new TraefikReadOnlyAdapterError(`Unsupported protocol "${parsed.protocol}". Must be http or https.`, 'UNSUPPORTED_PROTOCOL');
   }
 
+  // Reject embedded credentials in URL to avoid credential leakage or auth bypass
+  if (parsed.username || parsed.password) {
+    throw new TraefikReadOnlyAdapterError('Embedded credentials in API URL are strictly prohibited.', 'CREDENTIALS_PROHIBITED');
+  }
+
   const hostname = parsed.hostname.toLowerCase();
   const allowedInternalHosts = ['127.0.0.1', 'localhost', '::1'];
+  const configuredHost = process.env.KPANEL_TRAEFIK_INTERNAL_API_HOST
+    ? process.env.KPANEL_TRAEFIK_INTERNAL_API_HOST.trim().toLowerCase()
+    : null;
 
-  // Prohibit arbitrary internet hostnames or remote public cloud destinations
-  if (!allowedInternalHosts.includes(hostname) && !hostname.endsWith('.internal') && !hostname.endsWith('.local')) {
+  // Prohibit arbitrary internet hostnames, remote cloud destinations, and broad suffixes (.internal, .local)
+  if (!allowedInternalHosts.includes(hostname) && (!configuredHost || hostname !== configuredHost)) {
     throw new TraefikReadOnlyAdapterError(
-      `API target "${hostname}" is not an authorized local or internal host. External URLs strictly prohibited.`,
+      `API target "${hostname}" is not an authorized local loopback host. External URLs and broad domain suffixes (.internal, .local) are strictly prohibited for SSRF safety.`,
       'UNAUTHORIZED_API_TARGET'
     );
+  }
+
+  // Validate port range if specified
+  if (parsed.port) {
+    const portNum = parseInt(parsed.port, 10);
+    if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
+      throw new TraefikReadOnlyAdapterError(`Invalid port number "${parsed.port}". Must be between 1 and 65535.`, 'INVALID_PORT');
+    }
   }
 
   return parsed;
@@ -119,6 +135,20 @@ function assessFileProviderCompatibility(fileProvider, options = {}) {
     if (options.expectedHostPath && fileProvider.hostPath && options.expectedHostPath !== fileProvider.hostPath) {
       blockedReasons.push(`File provider host path mismatch: expected "${options.expectedHostPath}", observed "${fileProvider.hostPath}".`);
       pathMismatch = true;
+    }
+
+    // Check mount correspondence and read-only mount restriction
+    const mounts = options.mounts || fileProvider.mounts;
+    if (Array.isArray(mounts)) {
+      const matchedMount = mounts.find((m) => m && (m.destination === directory || directory.startsWith(m.destination)));
+      if (matchedMount) {
+        if (matchedMount.rw === false) {
+          blockedReasons.push(`File provider mount at "${matchedMount.destination}" is read-only (rw: false); K-Panel route updates would fail.`);
+        }
+        if (!fileProvider.hostPath && matchedMount.source) {
+          fileProvider.hostPath = matchedMount.source;
+        }
+      }
     }
   }
 

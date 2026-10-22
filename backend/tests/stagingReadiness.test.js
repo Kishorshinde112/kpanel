@@ -594,7 +594,7 @@ test('Phase 4C3C: Staging Integration Readiness & Read-Only VPS Inventory Suite'
           scope: 'local',
           containers: [{ id: 'traefik-container-12', name: 'traefik' }]
         },
-        { isApproved: true, expectedImageId: 'sha256:different-expected-image-digest-0000000000000000000000000000000' }
+        { approvedNetworkId: 'a1b2c3d4e5f60003', expectedImageId: 'sha256:different-expected-image-digest-0000000000000000000000000000000' }
       ),
       (err) => err instanceof StagingNetworkError && err.code === 'IMAGE_ID_MISMATCH'
     );

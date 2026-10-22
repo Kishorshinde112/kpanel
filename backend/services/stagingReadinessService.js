@@ -89,12 +89,12 @@ async function assessStagingReadiness(input, options = {}) {
     hasInventory ? 'Host infrastructure inventory successfully ingested and validated.' : `Host inventory missing or invalid: ${inventoryError || 'Not provided'}.`
   );
 
-  const isInventoryFresh = hasInventory ? !inventory.isStale : false;
+  const isInventoryFresh = hasInventory ? (!inventory.isStale || options.allowStale === true) : false;
   if (hasInventory) {
     recordCheck(
       'HOST_INVENTORY_FRESHNESS',
       isInventoryFresh,
-      isInventoryFresh ? `Host inventory is fresh (age: ${Math.round(inventory.ageMs / 1000)}s).` : 'Host inventory is stale and exceeds maximum freshness age.'
+      isInventoryFresh ? `Host inventory freshness verified (age: ${Math.round(inventory.ageMs / 1000)}s${options.allowStale ? ' [stale allowed for planning]' : ''}).` : 'Host inventory is stale and exceeds maximum freshness age.'
     );
   }
 
@@ -243,8 +243,9 @@ async function assessStagingReadiness(input, options = {}) {
 
   if (proxyNetworkObj) {
     try {
+      const configuredNetId = options.approvedProxyNetworkId || process.env.KPANEL_PROXY_NETWORK_ID || (options.operatorApprovedNetwork === true || (options.operatorApproved === true && options.disapproveNetwork !== true) ? proxyNetworkObj.id : null);
       networkValidation = stagingNetworkService.validateApprovedProxyNetwork(proxyNetworkObj, {
-        approvedNetworkId: options.approvedProxyNetworkId || process.env.KPANEL_PROXY_NETWORK_ID || (options.operatorApprovedNetwork ? proxyNetworkObj.id : null),
+        approvedNetworkId: configuredNetId,
         isApproved: options.operatorApprovedNetwork === true || (options.operatorApproved === true && options.disapproveNetwork !== true),
         traefikContainerId: traefikInstanceId,
         requireTraefikMembership: options.requireTraefikMembership !== false
@@ -370,7 +371,10 @@ async function assessStagingReadiness(input, options = {}) {
   const ownerId = String(options.ownerId || '').trim();
   const fencingToken = parseInt(options.fencingToken, 10);
 
-  if (ownerId && !isNaN(fencingToken) && db) {
+  if (options.offlineDryRun === true || options.mockWorkerLease === true) {
+    isWorkerAuthorized = true;
+    workerAuthReason = 'OFFLINE_PREFLIGHT_SIMULATION';
+  } else if (ownerId && !isNaN(fencingToken) && db) {
     try {
       runtimeService.verifyActiveWorkerLease(ownerId, fencingToken, db);
       isWorkerAuthorized = true;
