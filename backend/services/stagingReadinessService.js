@@ -96,13 +96,35 @@ async function assessStagingReadiness(input, options = {}) {
       isInventoryFresh,
       isInventoryFresh ? `Host inventory freshness verified (age: ${Math.round(inventory.ageMs / 1000)}s${options.allowStale ? ' [stale allowed for planning]' : ''}).` : 'Host inventory is stale and exceeds maximum freshness age.'
     );
+
+    // Enforce strict 60s freshness for live activation
+    if (options.purpose === 'activation') {
+      const isActivationFresh = Boolean(inventory.isFreshForActivation);
+      recordCheck(
+        'ACTIVATION_FRESHNESS_LIMIT',
+        isActivationFresh,
+        isActivationFresh ? 'Host inventory captured within strict 60s activation limit.' : `Host inventory age (${Math.round(inventory.ageMs / 1000)}s) exceeds strict 60s activation freshness limit.`
+      );
+    }
+
+    // Incomplete inventory cannot yield a production-ready decision
+    const isComplete = Boolean(inventory.isComplete);
+    recordCheck(
+      'INVENTORY_COMPLETENESS',
+      isComplete,
+      isComplete ? 'Host inventory is complete across all structural inspection domains.' : `Host inventory is incomplete or unverifiable: ${inventory.missingOrUnverifiable ? inventory.missingOrUnverifiable.join(', ') : 'Unknown'}.`
+    );
   }
 
   // ---------------------------------------------------------------------------
-  // Factor 2: Traefik Instance Identity
+  // Factor 2: Traefik Instance Identity & Multi-Proxy Detection
   // ---------------------------------------------------------------------------
   const traefikInstanceId = inventory?.traefik?.instanceId || options.traefikInstanceId || null;
   const isTraefikIdentified = Boolean(traefikInstanceId);
+  const multipleProxiesDetected = Boolean(
+    inventory?.traefik &&
+    (inventory.traefik.instancesDetected > 1 || inventory.traefik.status === 'multiple-instances-detected')
+  );
 
   // Check for conflicting Traefik instances
   const instanceConflict = Boolean(
@@ -113,10 +135,12 @@ async function assessStagingReadiness(input, options = {}) {
 
   recordCheck(
     'TRAEFIK_INSTANCE_IDENTIFIED',
-    isTraefikIdentified && !instanceConflict,
-    !isTraefikIdentified
-      ? 'Traefik instance identity cannot be determined from host inventory.'
-      : (instanceConflict ? `Traefik instance mismatch: expected "${options.expectedTraefikInstanceId}", observed "${traefikInstanceId}".` : `Traefik instance identified: "${traefikInstanceId}".`)
+    isTraefikIdentified && !instanceConflict && !multipleProxiesDetected,
+    multipleProxiesDetected
+      ? `Multiple Traefik proxy instances (${inventory.traefik.instancesDetected}) detected on host; unresolved proxy ownership cannot authorize routing.`
+      : (!isTraefikIdentified
+        ? 'Traefik instance identity cannot be determined from host inventory.'
+        : (instanceConflict ? `Traefik instance mismatch: expected "${options.expectedTraefikInstanceId}", observed "${traefikInstanceId}".` : `Traefik instance identified: "${traefikInstanceId}".`))
   );
 
   // ---------------------------------------------------------------------------
@@ -470,6 +494,10 @@ async function assessStagingReadiness(input, options = {}) {
     decision = STAGING_DECISIONS.STAGING_UNVERIFIED;
   } else if (hasInventory && !isInventoryFresh) {
     decision = STAGING_DECISIONS.STAGING_BLOCKED_STALE_INVENTORY;
+  } else if (options.purpose === 'activation' && hasInventory && !inventory.isFreshForActivation) {
+    decision = STAGING_DECISIONS.STAGING_BLOCKED_STALE_INVENTORY;
+  } else if (multipleProxiesDetected) {
+    decision = STAGING_DECISIONS.STAGING_UNVERIFIED;
   } else if (!isTraefikIdentified || instanceConflict || !providerAvailable || (requiredProvider === 'file' && !fileProviderCompatibility.compatible)) {
     decision = STAGING_DECISIONS.STAGING_BLOCKED_PROVIDER;
   } else if (!noForeignConflict) {
@@ -484,6 +512,9 @@ async function assessStagingReadiness(input, options = {}) {
     decision = STAGING_DECISIONS.STAGING_BLOCKED_AUTHORIZATION;
   } else if (!isRollbackReady) {
     decision = STAGING_DECISIONS.STAGING_BLOCKED_ROLLBACK;
+  } else if (inventory && !inventory.isComplete) {
+    // Incomplete inventory must not yield a production-ready decision
+    decision = STAGING_DECISIONS.STAGING_UNVERIFIED;
   } else {
     decision = STAGING_DECISIONS.STAGING_READY_FOR_AUTHORIZED_TEST;
   }
@@ -495,6 +526,7 @@ async function assessStagingReadiness(input, options = {}) {
     decision,
     isReadyForAuthorizedTest: decision === STAGING_DECISIONS.STAGING_READY_FOR_AUTHORIZED_TEST,
     evidenceType,
+    productionNotice: 'Offline fixture test success does not constitute proof that live Oracle production environment is compatible.',
     executed: false, // Strictly false in this phase!
     applicationId,
     targetDomain,

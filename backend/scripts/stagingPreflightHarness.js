@@ -105,13 +105,14 @@ async function runStagingPreflightHarness(options = {}) {
   // 5. Synthesize Complete Preflight Evaluation
   const completeReport = {
     preflightRunAt: new Date().toISOString(),
-    harnessVersion: '1.0',
+    harnessVersion: '1.2',
     mode: 'offline-dry-run',
     executed: false, // Strict invariant: Zero live mutations
     dryRun: true,
     isSynthetic: Boolean(rawInventory.isSynthetic || !ingested.originVerified),
     evidenceSource: ingested.captureSource,
     provenanceStatus: ingested.provenanceStatus,
+    productionNotice: 'Offline fixture test success does not constitute proof that live Oracle production environment is compatible.',
     scenario: scenarioReport,
     readiness: readinessReport,
     freshnessEvaluation: {

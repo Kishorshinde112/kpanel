@@ -6,20 +6,18 @@
 #   Collects non-sensitive, read-only host infrastructure, Docker network, and
 #   Traefik configuration observations for operator review and staging integration planning.
 #
-# AUDITED COMMAND CLASSIFICATION (PHASE 4C3D1):
+# AUDITED COMMAND CLASSIFICATION (PHASE 4C3D2):
 #   1. READ-ONLY AND SAFE:
 #      - hostname, uname (-s, -m, -r), date (-u)
 #      - docker version, docker info (read-only capability check)
 #      - docker ps (read-only container state filter)
 #      - docker network ls, docker network inspect (explicit safe fields only)
-#      - docker inspect (strictly filtered to .Config.Cmd and .Mounts; NEVER .Config.Env)
+#      - docker inspect (strictly filtered to allowlisted provider flags & mounts; NEVER .Config.Env)
 #      - timeout (bounded execution timer)
-#   2. READ-ONLY BUT POTENTIALLY SENSITIVE (SUBJECT TO OPERATOR REDACTION):
-#      - Internal hostnames and kernel identifiers
-#      - Private Docker bridge IPv4 container addresses
-#      - Container names and network IDs
-#      - Traefik router rules (when discovered via loopback API)
-#   3. POTENTIALLY MUTATING OR UNSAFE COMMANDS (STRICTLY PROHIBITED & ABSENT):
+#   2. STRICTLY PROHIBITED & REMOVED (SAFETY AUDIT):
+#      - ZERO docker exec (NO process execution inside running containers)
+#      - ZERO export of raw .Config.Cmd or .Config.Entrypoint arrays
+#      - ZERO automatic query of localhost:8080 or unverified HTTP ports
 #      - ZERO: docker run, docker start, docker stop, docker rm
 #      - ZERO: docker network connect, docker network disconnect, docker network create/rm
 #      - ZERO: docker system prune, docker compose up/down
@@ -27,14 +25,13 @@
 #      - ZERO: iptables, ufw, firewall-cmd modifications
 #      - ZERO: writes to production configuration files
 #      - ZERO: reads from .env files, private keys, database passwords, or session tokens
-#   4. HOST-DEPENDENT & OPTIONAL:
-#      - curl (strictly local loopback 127.0.0.1; disabled/skipped gracefully if unreachable)
-#      - timeout (falls back gracefully to direct execution if timeout utility missing)
+#   3. OPTIONAL & OPERATOR-CONTROLLED:
+#      - Traefik API probe: strictly opt-in via --probe-api (default: disabled)
+#      - Redaction / sanitization: --redact / --sanitize (masks private IPv4/IPv6, hostnames, paths, credentials)
 #
 # SAFETY & RESTRICTIVE PERMISSIONS:
 #   - Enforces umask 077 so any generated output file is readable strictly by operator (0600).
-#   - Supports --redact / --sanitize flag to mask internal IPs, container names, and hostnames
-#     for safe sharing with architecture reviewers.
+#   - Atomic temporary file creation with restricted permissions before rename.
 # ==============================================================================
 
 set -euo pipefail
@@ -46,10 +43,13 @@ umask 077
 export LC_ALL=C
 
 CAPTURED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-INVENTORY_VERSION="1.1"
+INVENTORY_VERSION="1.2"
 
 OUTPUT_FILE=""
+REDACTED_OUTPUT_FILE=""
 REDACT_OUTPUT=false
+ENABLE_API_PROBE=false
+LOCAL_PORT=8080
 
 # Parse command line flags
 while [ $# -gt 0 ]; do
@@ -58,18 +58,38 @@ while [ $# -gt 0 ]; do
       OUTPUT_FILE="${2:-}"
       shift 2
       ;;
+    --summary-output|--redacted-output)
+      REDACTED_OUTPUT_FILE="${2:-}"
+      shift 2
+      ;;
     --redact|--sanitize)
       REDACT_OUTPUT=true
       shift
+      ;;
+    --probe-api|--enable-api-probe)
+      ENABLE_API_PROBE=true
+      shift
+      ;;
+    --api-port)
+      LOCAL_PORT="${2:-8080}"
+      shift 2
       ;;
     -h|--help)
       cat << 'USAGE'
 Usage: bash collect-kpanel-host-inventory.sh [options] [output-file]
 
 Options:
-  -o, --output <file>    Write inventory JSON to specified file with 0600 permissions.
-  --redact, --sanitize   Mask IP addresses, internal container names, and hostnames for safe external review.
-  -h, --help             Show this help message.
+  -o, --output <file>            Write private full inventory JSON to specified file with 0600 permissions.
+  --summary-output <file>        Write redacted review summary JSON to specified file with 0600 permissions.
+  --redact, --sanitize           Produce sanitized review output (masks private IPv4/IPv6, hostnames, paths, credentials).
+  --probe-api                    Opt-in to probe local Traefik internal API on loopback (default: disabled, no HTTP calls).
+  --api-port <port>              Loopback port to probe when --probe-api is enabled (default: 8080, validated 1-65535).
+  -h, --help                     Show this help message.
+
+Safety Guarantees:
+  - Strictly read-only; zero container modifications, network attachments, or daemon restarts.
+  - Zero container exec; inspects host-side Docker metadata only.
+  - Restricts file creation permissions to operator (0600) via umask 077.
 USAGE
       exit 0
       ;;
@@ -84,6 +104,14 @@ USAGE
       ;;
   esac
 done
+
+# Validate --api-port if API probe requested
+if [ "$ENABLE_API_PROBE" = true ]; then
+  if ! [[ "$LOCAL_PORT" =~ ^[0-9]+$ ]] || [ "$LOCAL_PORT" -lt 1 ] || [ "$LOCAL_PORT" -gt 65535 ]; then
+    echo "Error: Invalid API port '${LOCAL_PORT}'. Must be an integer between 1 and 65535." >&2
+    exit 1
+  fi
+fi
 
 # Helper to check command availability
 has_cmd() {
@@ -156,7 +184,7 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
   NET_IDS=$(run_bounded 5 docker network ls -q 2>/dev/null || echo "")
 
   if [ -n "$NET_IDS" ]; then
-    # Inspect selected non-sensitive metadata only
+    # Inspect selected non-sensitive metadata only:
     # ID, Name, Driver, Scope, Internal, Attachable, and attached container names/IPv4
     NETWORKS_RAW=$(run_bounded 10 docker network inspect $NET_IDS --format '
     {
@@ -180,27 +208,22 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
 
     # Clean up trailing comma and null placeholder
     if [ -n "$NETWORKS_RAW" ]; then
-      CLEANED_NETS=$(echo "$NETWORKS_RAW" | sed 's/,\s*null//g' | sed '$ s/,$//')
+      CLEANED_NETS=$(echo "$NETWORKS_RAW" | tr '\n' ' ' | sed 's/,\s*null//g' | sed -E 's/,\s*\]/ ]/g' | sed 's/,\s*$//')
       NETWORKS_JSON="[ $CLEANED_NETS ]"
     fi
   fi
-fi
-
-# Apply redaction to network JSON if requested
-if [ "$REDACT_OUTPUT" = true ] && [ "$NETWORKS_JSON" != "[]" ]; then
-  # Mask IPv4 addresses: 172.XX.YY.ZZ -> 172.XX.REDACTED
-  NETWORKS_JSON=$(echo "$NETWORKS_JSON" | sed -E 's/"ipv4Address": "([0-9]+\.[0-9]+)\.[0-9]+\.[0-9]+(\/[0-9]+)?"/"ipv4Address": "\1.x.x\2"/g')
 fi
 
 # ------------------------------------------------------------------------------
 # 4. Traefik Container & Provider Discovery (Read-Only)
 # ------------------------------------------------------------------------------
 TRAEFIK_CONTAINER_ID=""
-TRAEFIK_VERSION=""
+TRAEFIK_VERSION="version_unverified"
 TRAEFIK_CONTAINER_NAME=""
 TRAEFIK_STATUS="not-found"
 TRAEFIK_INSTANCES_FOUND=0
 TRAEFIK_MOUNTS_JSON="[]"
+TRAEFIK_CANDIDATES_JSON="[]"
 
 FILE_PROVIDER_ENABLED=false
 FILE_PROVIDER_DIR=""
@@ -209,7 +232,7 @@ DOCKER_PROVIDER_ENABLED=false
 DOCKER_PROVIDER_NETWORK=""
 
 if [ "$DOCKER_AVAILABLE" = true ]; then
-  # Discover candidate Traefik container by image name or container name
+  # Discover candidate Traefik containers by container name or image ancestor
   # Strictly read ID, Names, Image, and Status - NEVER Env!
   TRAEFIK_CANDIDATES=$(run_bounded 5 docker ps --filter "name=traefik" --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null || echo "")
 
@@ -219,79 +242,122 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
 
   if [ -n "$TRAEFIK_CANDIDATES" ]; then
     TRAEFIK_INSTANCES_FOUND=$(echo "$TRAEFIK_CANDIDATES" | grep -c . || echo 0)
-    TRAEFIK_PRIMARY=$(echo "$TRAEFIK_CANDIDATES" | head -n 1)
 
+    # Build candidates JSON list for multi-instance auditing
+    CANDIDATES_ENTRIES=""
+    while IFS='|' read -r c_id c_name c_image c_status; do
+      [ -z "$c_id" ] && continue
+      ENTRY="{\"id\":\"${c_id}\",\"name\":\"${c_name}\",\"image\":\"${c_image}\",\"status\":\"${c_status}\"}"
+      if [ -z "$CANDIDATES_ENTRIES" ]; then
+        CANDIDATES_ENTRIES="$ENTRY"
+      else
+        CANDIDATES_ENTRIES="${CANDIDATES_ENTRIES},${ENTRY}"
+      fi
+    done <<< "$TRAEFIK_CANDIDATES"
+    TRAEFIK_CANDIDATES_JSON="[ ${CANDIDATES_ENTRIES} ]"
+
+    if [ "$TRAEFIK_INSTANCES_FOUND" -gt 1 ]; then
+      TRAEFIK_STATUS="multiple-instances-detected"
+    fi
+
+    # Select primary candidate for inspection
+    TRAEFIK_PRIMARY=$(echo "$TRAEFIK_CANDIDATES" | head -n 1)
     TRAEFIK_CONTAINER_ID=$(echo "$TRAEFIK_PRIMARY" | cut -d'|' -f1)
     TRAEFIK_CONTAINER_NAME=$(echo "$TRAEFIK_PRIMARY" | cut -d'|' -f2)
     TRAEFIK_IMAGE=$(echo "$TRAEFIK_PRIMARY" | cut -d'|' -f3)
-    TRAEFIK_STATUS=$(echo "$TRAEFIK_PRIMARY" | cut -d'|' -f4)
+    if [ "$TRAEFIK_INSTANCES_FOUND" -eq 1 ]; then
+      TRAEFIK_STATUS=$(echo "$TRAEFIK_PRIMARY" | cut -d'|' -f4)
+    fi
 
-    # Inspect container command / arguments to detect configured providers
-    # DO NOT inspect .Config.Env or full container state
+    # Inspect container command flags to detect configured providers
+    # DO NOT inspect .Config.Env or export raw .Config.Cmd
     TRAEFIK_ARGS=$(run_bounded 3 docker inspect "$TRAEFIK_CONTAINER_ID" --format '{{json .Config.Cmd}}' 2>/dev/null || echo "[]")
 
     if echo "$TRAEFIK_ARGS" | grep -q -- "--providers.file"; then
       FILE_PROVIDER_ENABLED=true
     fi
-    if echo "$TRAEFIK_ARGS" | grep -q -- "--providers.file.watch=true"; then
+    if echo "$TRAEFIK_ARGS" | grep -q -- "--providers.file.watch=true" || echo "$TRAEFIK_ARGS" | grep -q -- "--providers.file.watch\""; then
       FILE_PROVIDER_WATCH=true
     fi
     if echo "$TRAEFIK_ARGS" | grep -q -- "--providers.file.directory="; then
-      FILE_PROVIDER_DIR=$(echo "$TRAEFIK_ARGS" | grep -o -- '--providers.file.directory=[^ "]*' | head -n 1 | cut -d'=' -f2)
+      RAW_DIR=$(echo "$TRAEFIK_ARGS" | grep -o -- '--providers.file.directory=[^ "]*' | head -n 1 | cut -d'=' -f2 | tr -d '"')
+      # Sanitize directory value: reject traversal (..), null bytes, or credential keywords
+      if [[ "$RAW_DIR" == *".."* ]] || echo "$RAW_DIR" | grep -qiE "password|secret|token|key"; then
+        FILE_PROVIDER_DIR=""
+      else
+        FILE_PROVIDER_DIR="$RAW_DIR"
+      fi
     fi
 
     if echo "$TRAEFIK_ARGS" | grep -q -- "--providers.docker"; then
       DOCKER_PROVIDER_ENABLED=true
     fi
     if echo "$TRAEFIK_ARGS" | grep -q -- "--providers.docker.network="; then
-      DOCKER_PROVIDER_NETWORK=$(echo "$TRAEFIK_ARGS" | grep -o -- '--providers.docker.network=[^ "]*' | head -n 1 | cut -d'=' -f2)
+      RAW_NET=$(echo "$TRAEFIK_ARGS" | grep -o -- '--providers.docker.network=[^ "]*' | head -n 1 | cut -d'=' -f2 | tr -d '"')
+      if echo "$RAW_NET" | grep -qiE "password|secret|token|key"; then
+        DOCKER_PROVIDER_NETWORK=""
+      else
+        DOCKER_PROVIDER_NETWORK="$RAW_NET"
+      fi
     fi
 
     # Read mount configuration to establish host/container mount correspondence for File provider
     # Extracts Type, Source, Destination, Mode, RW. Zero environment variables.
-    RAW_MOUNTS=$(run_bounded 3 docker inspect "$TRAEFIK_CONTAINER_ID" --format '
-    [
-      {{range .Mounts}}
-      {
-        "type": "{{.Type}}",
-        "source": "{{.Source}}",
-        "destination": "{{.Destination}}",
-        "mode": "{{.Mode}}",
-        "rw": {{if .RW}}true{{else}}false{{end}}
-      },
-      {{end}}
-      null
-    ]' 2>/dev/null || echo "[]")
+    RAW_MOUNTS=$(run_bounded 3 docker inspect "$TRAEFIK_CONTAINER_ID" --format '{{json .Mounts}}' 2>/dev/null || echo "[]")
 
-    if [ "$RAW_MOUNTS" != "[]" ]; then
-      CLEANED_MOUNTS=$(echo "$RAW_MOUNTS" | sed 's/,\s*null//g' | sed '$ s/,$//')
-      TRAEFIK_MOUNTS_JSON="$CLEANED_MOUNTS"
+    if [ -n "$RAW_MOUNTS" ] && [ "$RAW_MOUNTS" != "null" ]; then
+      TRAEFIK_MOUNTS_JSON="$RAW_MOUNTS"
     fi
 
-    # Check Traefik binary version safely with bounded timeout
-    TRAEFIK_VERSION=$(run_bounded 3 docker exec "$TRAEFIK_CONTAINER_ID" traefik version 2>/dev/null | grep -i "version:" | head -n 1 | awk '{print $2}' || echo "unknown")
+    # Extract Traefik version strictly from host-side Docker metadata (NO docker exec)
+    TRAEFIK_VERSION="version_unverified"
+    # 1. Attempt extraction from image tag if specific version pattern exists
+    IMAGE_TAG=$(echo "$TRAEFIK_IMAGE" | grep -oE ':(v?[0-9]+\.[0-9]+(\.[0-9]+)?)' | tr -d ':' || echo "")
+    if [ -n "$IMAGE_TAG" ]; then
+      TRAEFIK_VERSION="$IMAGE_TAG"
+    else
+      # 2. Attempt inspection of OCI version label from host-side image metadata
+      OCI_VERSION=$(run_bounded 3 docker inspect "$TRAEFIK_CONTAINER_ID" --format '{{index .Config.Labels "org.opencontainers.image.version"}}' 2>/dev/null || echo "")
+      if [ -n "$OCI_VERSION" ] && [ "$OCI_VERSION" != "<no value>" ]; then
+        TRAEFIK_VERSION="$OCI_VERSION"
+      fi
+    fi
+    # If unverified, keep "version_unverified" (do not fabricate version)
   fi
 fi
 
 # ------------------------------------------------------------------------------
-# 5. Traefik Routing Discovery (Read-Only Local Internal API, If Enabled & Safe)
+# 5. Traefik Routing Discovery (Read-Only Local Internal API, Strictly Opt-In)
 # ------------------------------------------------------------------------------
 ROUTERS_JSON="[]"
 SERVICES_JSON="[]"
 ENTRYPOINTS_JSON="[]"
-API_STATUS="disabled_or_unreachable"
+API_STATUS="disabled_or_skipped"
 
-# Note: We test strictly local internal loopback (127.0.0.1:8080 or TRAEFIK_LOCAL_API_PORT).
-# We DO NOT expose or modify Traefik. We DO NOT send external requests or credentials.
-LOCAL_PORT="${TRAEFIK_LOCAL_API_PORT:-8080}"
-if has_cmd curl; then
-  # Strictly bounded timeout, no redirects, loopback only
-  API_TEST=$(run_bounded 2 curl -s --max-time 2 --connect-timeout 1 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${LOCAL_PORT}/api/rawdata" 2>/dev/null || echo "000")
-  if [ "$API_TEST" = "200" ]; then
-    API_STATUS="accessible_local_api"
-    ROUTERS_JSON=$(run_bounded 2 curl -s --max-time 2 "http://127.0.0.1:${LOCAL_PORT}/api/http/routers" 2>/dev/null || echo "[]")
-    SERVICES_JSON=$(run_bounded 2 curl -s --max-time 2 "http://127.0.0.1:${LOCAL_PORT}/api/http/services" 2>/dev/null || echo "[]")
-    ENTRYPOINTS_JSON=$(run_bounded 2 curl -s --max-time 2 "http://127.0.0.1:${LOCAL_PORT}/api/entrypoints" 2>/dev/null || echo "[]")
+# Security Invariant: API probing is STRICTLY OPT-IN (--probe-api).
+# Default behavior is zero HTTP requests. Port 8080 is NOT queried automatically.
+if [ "$ENABLE_API_PROBE" = true ]; then
+  API_STATUS="disabled_or_unreachable"
+  if has_cmd curl; then
+    # Strictly loopback only (127.0.0.1), short timeouts (1s connect, 2s max), no redirects (--max-redirs 0), bounded size
+    set +e
+    API_TEST=$(run_bounded 2 curl -s --max-time 2 --connect-timeout 1 --max-redirs 0 -o /dev/null -w "%{http_code}" "http://127.0.0.1:${LOCAL_PORT}/api/rawdata" 2>/dev/null || echo "000")
+    set -e
+
+    if [ "$API_TEST" = "200" ]; then
+      # Verify observed service identity: check if /api/rawdata or /api/http/routers returns valid JSON containing expected router markers
+      RAW_ROUTERS=$(run_bounded 2 curl -s --max-time 2 --connect-timeout 1 --max-redirs 0 "http://127.0.0.1:${LOCAL_PORT}/api/http/routers" 2>/dev/null | head -c 1048576 || echo "[]")
+      if echo "$RAW_ROUTERS" | grep -q "rule" || echo "$RAW_ROUTERS" | grep -q "service" || [ "$RAW_ROUTERS" = "[]" ]; then
+        API_STATUS="accessible_local_api"
+        ROUTERS_JSON="$RAW_ROUTERS"
+        SERVICES_JSON=$(run_bounded 2 curl -s --max-time 2 --connect-timeout 1 --max-redirs 0 "http://127.0.0.1:${LOCAL_PORT}/api/http/services" 2>/dev/null | head -c 1048576 || echo "[]")
+        ENTRYPOINTS_JSON=$(run_bounded 2 curl -s --max-time 2 --connect-timeout 1 --max-redirs 0 "http://127.0.0.1:${LOCAL_PORT}/api/entrypoints" 2>/dev/null | head -c 1048576 || echo "[]")
+      else
+        API_STATUS="unverified_service_on_port"
+      fi
+    else
+      API_STATUS="disabled_or_unreachable"
+    fi
   fi
 fi
 
@@ -331,14 +397,35 @@ fi
 # ------------------------------------------------------------------------------
 # 7. Assemble Structured JSON Inventory Report
 # ------------------------------------------------------------------------------
-INVENTORY_REPORT=$(cat <<EOF
+assemble_inventory_json() {
+  local is_redacted="$1"
+  local host_name="$2"
+  local net_json="$3"
+  local mounts_json="$4"
+  local candidates_json="$5"
+  local disclaimer_field=""
+
+  if [ "$is_redacted" = true ]; then
+    disclaimer_field=$(cat <<'DISC'
+,
+  "sharingSummary": {
+    "isRedacted": true,
+    "networkAuthorizationStatus": "UNVERIFIED_NETWORK_ID_REDACTED",
+    "networkAuthorizationNotice": "Network IDs and addresses are sanitized in this review summary. Exact network authorization must be verified against private full inventory.",
+    "sharingDisclaimer": "Automated redaction sanitizes private IPv4/IPv6 ranges, hostnames, usernames in paths, and container identifiers, but cannot guarantee zero sensitive data. Operator manual inspection is required before external distribution."
+  }
+DISC
+)
+  fi
+
+  cat <<EOF
 {
   "version": "${INVENTORY_VERSION}",
   "captureTimestamp": "${CAPTURED_AT}",
   "captureSource": "operator-script",
-  "isRedacted": ${REDACT_OUTPUT},
+  "isRedacted": ${is_redacted},
   "hostIdentity": {
-    "hostname": "${HOSTNAME}",
+    "hostname": "${host_name}",
     "os": "${OS_INFO}",
     "arch": "${ARCH_INFO}",
     "kernel": "${KERNEL_INFO}",
@@ -351,8 +438,9 @@ INVENTORY_REPORT=$(cat <<EOF
     "version": ${TRAEFIK_VER_JSON},
     "status": "${TRAEFIK_STATUS}",
     "instancesDetected": ${TRAEFIK_INSTANCES_FOUND},
+    "detectedCandidates": ${candidates_json},
     "apiStatus": "${API_STATUS}",
-    "mounts": ${TRAEFIK_MOUNTS_JSON}
+    "mounts": ${mounts_json}
   },
   "providers": {
     "file": {
@@ -365,27 +453,101 @@ INVENTORY_REPORT=$(cat <<EOF
       "network": ${DOCKER_NET_JSON}
     }
   },
-  "networks": ${NETWORKS_JSON},
+  "networks": ${net_json},
   "routers": ${ROUTERS_JSON},
   "services": ${SERVICES_JSON},
-  "entryPoints": ${ENTRYPOINTS_JSON}
+  "entryPoints": ${ENTRYPOINTS_JSON}${disclaimer_field}
 }
 EOF
-)
+}
 
 # ------------------------------------------------------------------------------
-# 8. Output Handling (Stdout or Atomic File with 0600 Permissions)
+# 8. Redaction Engine (Sanitizes Private IP Ranges, Hostnames, Paths, Credentials)
 # ------------------------------------------------------------------------------
-if [ -n "$OUTPUT_FILE" ]; then
-  OUT_DIR=$(dirname "$OUTPUT_FILE")
-  if [ ! -d "$OUT_DIR" ]; then
-    mkdir -p "$OUT_DIR"
+redact_content() {
+  local content="$1"
+
+  # 1. Redact Private IPv4 addresses:
+  # 10.0.0.0/8
+  content=$(echo "$content" | sed -E 's/"ipv4Address": "10\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?"/"ipv4Address": "10.x.x.x\1"/g')
+  # 172.16.0.0/12 (172.16.x.x - 172.31.x.x)
+  content=$(echo "$content" | sed -E 's/"ipv4Address": "(172\.(1[6-9]|2[0-9]|3[0-1]))\.[0-9]+\.[0-9]+(\/[0-9]+)?"/"ipv4Address": "\1.x.x\3"/g')
+  # 192.168.0.0/16
+  content=$(echo "$content" | sed -E 's/"ipv4Address": "192\.168\.[0-9]+\.[0-9]+(\/[0-9]+)?"/"ipv4Address": "192.168.x.x\1"/g')
+  # 100.64.0.0/10 (CGNAT)
+  content=$(echo "$content" | sed -E 's/"ipv4Address": "(100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7]))\.[0-9]+\.[0-9]+(\/[0-9]+)?"/"ipv4Address": "\1.x.x\3"/g')
+  # 127.0.0.0/8
+  content=$(echo "$content" | sed -E 's/"ipv4Address": "127\.[0-9]+\.[0-9]+\.[0-9]+(\/[0-9]+)?"/"ipv4Address": "127.x.x.x\1"/g')
+
+  # 2. Redact Private IPv6 addresses:
+  # ULA (fc00::/7)
+  content=$(echo "$content" | sed -E 's/(fc|fd)[0-9a-fA-F]{2}:[0-9a-fA-F:]+/[REDACTED-IPV6-ULA]/g')
+  # Link-Local (fe80::/10)
+  content=$(echo "$content" | sed -E 's/fe80:[0-9a-fA-F:]+/[REDACTED-IPV6-LINKLOCAL]/g')
+  # Loopback (::1)
+  content=$(echo "$content" | sed -E 's/"::1"/[REDACTED-IPV6-LOOPBACK]/g')
+
+  # 3. Redact Sensitive Usernames in Host Paths:
+  content=$(echo "$content" | sed -E 's|/home/[a-zA-Z0-9._-]+|/home/[REDACTED-USER]|g')
+  content=$(echo "$content" | sed -E 's|/Users/[a-zA-Z0-9._-]+|/Users/[REDACTED-USER]|g')
+  content=$(echo "$content" | sed -E 's|/root/|/[REDACTED-ROOT]/|g')
+
+  # 4. Redact Potential Credentials in String Arguments:
+  content=$(echo "$content" | sed -E 's/(password|secret|token|api_key|apikey)=[^ "&,\\]+/\1=[REDACTED]/gI')
+
+  echo "$content"
+}
+
+# ------------------------------------------------------------------------------
+# 9. Output Generation (Full Private Inventory and/or Redacted Review Summary)
+# ------------------------------------------------------------------------------
+# Generate full private inventory content
+FULL_INVENTORY=$(assemble_inventory_json false "$HOSTNAME_RAW" "$NETWORKS_JSON" "$TRAEFIK_MOUNTS_JSON" "$TRAEFIK_CANDIDATES_JSON")
+
+# Generate redacted summary content
+REDACTED_NETWORKS=$(redact_content "$NETWORKS_JSON")
+REDACTED_MOUNTS=$(redact_content "$TRAEFIK_MOUNTS_JSON")
+REDACTED_CANDIDATES=$(redact_content "$TRAEFIK_CANDIDATES_JSON")
+REDACTED_INVENTORY=$(assemble_inventory_json true "[REDACTED-HOST]" "$REDACTED_NETWORKS" "$REDACTED_MOUNTS" "$REDACTED_CANDIDATES")
+REDACTED_INVENTORY=$(redact_content "$REDACTED_INVENTORY")
+
+# Helper to write restricted output file safely
+write_restricted_file() {
+  local target_path="$1"
+  local content="$2"
+  local label="$3"
+
+  local target_dir
+  target_dir=$(dirname "$target_path")
+  if [ ! -d "$target_dir" ]; then
+    mkdir -p -m 0700 "$target_dir"
   fi
-  TMP_OUT="${OUTPUT_FILE}.tmp.$$"
-  echo "$INVENTORY_REPORT" > "$TMP_OUT"
-  chmod 600 "$TMP_OUT"
-  mv "$TMP_OUT" "$OUTPUT_FILE"
-  echo "Host inventory successfully written to: $OUTPUT_FILE (mode 0600)" >&2
+
+  local tmp_file="${target_path}.tmp.$$"
+  echo "$content" > "$tmp_file"
+  chmod 600 "$tmp_file"
+  mv "$tmp_file" "$target_path"
+  echo "${label} successfully written to: ${target_path} (mode 0600)" >&2
+}
+
+# Write summary output if requested
+if [ -n "$REDACTED_OUTPUT_FILE" ]; then
+  write_restricted_file "$REDACTED_OUTPUT_FILE" "$REDACTED_INVENTORY" "Redacted review summary"
+fi
+
+# Main output target
+if [ "$REDACT_OUTPUT" = true ]; then
+  FINAL_OUTPUT="$REDACTED_INVENTORY"
 else
-  echo "$INVENTORY_REPORT"
+  FINAL_OUTPUT="$FULL_INVENTORY"
+fi
+
+if [ -n "$OUTPUT_FILE" ]; then
+  OUTPUT_LABEL="Host inventory"
+  if [ "$REDACT_OUTPUT" = true ]; then
+    OUTPUT_LABEL="Redacted host inventory"
+  fi
+  write_restricted_file "$OUTPUT_FILE" "$FINAL_OUTPUT" "$OUTPUT_LABEL"
+else
+  echo "$FINAL_OUTPUT"
 fi

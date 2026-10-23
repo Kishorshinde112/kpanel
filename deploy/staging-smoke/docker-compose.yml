@@ -1,0 +1,132 @@
+# ==============================================================================
+# K-PANEL DISPOSABLE STAGING SMOKE-TEST COMPOSE STACK (PHASE 4C3D4)
+# ==============================================================================
+# Invariants:
+# 1. Independent Compose project namespace (${COMPOSE_PROJECT_NAME:-kpanel-smoke-demo})
+# 2. Never collides with kpanel, kpanel-clean, dokploy, or n8n
+# 3. Dedicated Compose-owned bridge network (staging_net)
+# 4. Candidate application container has ZERO published host ports
+# 5. Ingress container binds EXCLUSIVELY to loopback: 127.0.0.1:${STAGING_INGRESS_PORT:-18080}:8080
+# 6. Strict privilege boundary: cap_drop ALL, no-new-privileges, unprivileged users, read_only rootfs
+# 7. Zero Docker socket mounts, zero production Traefik labels (traefik.enable=false)
+# 8. Bounded CPU, RAM, PID, and log resources
+# ==============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-kpanel-smoke-demo}
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. Disposable, Stateless Candidate Application
+  # ----------------------------------------------------------------------------
+  candidate:
+    image: ${CANDIDATE_IMAGE:-kpanel-smoke-candidate:local}
+    build:
+      context: ./candidate
+      dockerfile: Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-kpanel-smoke-demo}-candidate
+    user: "node"
+    restart: "no"
+    networks:
+      - staging_net
+    expose:
+      - "8080"
+    # Strict invariant: candidate container has NO published host ports
+    ports: []
+    environment:
+      - PORT=8080
+      - NODE_ENV=production
+      - APP_NAME=kpanel-smoke-candidate
+      - APP_VERSION=1.0.0
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,size=64m"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "1024M"
+          pids: 256
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    labels:
+      - "traefik.enable=false"
+      - "io.kpanel.managed=true"
+      - "io.kpanel.role=candidate"
+      - "io.kpanel.environment=staging-smoke"
+      - "io.kpanel.smoke-run-id=${SMOKE_RUN_ID:-smoke-run-demo}"
+
+  # ----------------------------------------------------------------------------
+  # 2. Dedicated Staging Ingress (Unprivileged Reverse Proxy)
+  # ----------------------------------------------------------------------------
+  ingress:
+    image: ${INGRESS_IMAGE:-kpanel-smoke-ingress:local}
+    build:
+      context: ./ingress
+      dockerfile: Dockerfile
+    container_name: ${COMPOSE_PROJECT_NAME:-kpanel-smoke-demo}-ingress
+    user: "101:101"
+    restart: "no"
+    depends_on:
+      candidate:
+        condition: service_healthy
+    networks:
+      - staging_net
+    # Strict invariant: loopback only binding, never 0.0.0.0
+    ports:
+      - "127.0.0.1:${STAGING_INGRESS_PORT:-18080}:8080"
+    volumes:
+      - ./ingress/nginx.conf:/etc/nginx/nginx.conf:ro
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,noexec,nosuid,size=32m"
+      - "/var/cache/nginx:rw,noexec,nosuid,size=32m"
+      - "/var/run:rw,noexec,nosuid,size=16m"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: "256M"
+          pids: 64
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    labels:
+      - "traefik.enable=false"
+      - "io.kpanel.managed=true"
+      - "io.kpanel.role=staging-ingress"
+      - "io.kpanel.environment=staging-smoke"
+      - "io.kpanel.smoke-run-id=${SMOKE_RUN_ID:-smoke-run-demo}"
+
+# ------------------------------------------------------------------------------
+# 3. Dedicated Bridge Network (Compose Owned & Namespaced)
+# ------------------------------------------------------------------------------
+networks:
+  staging_net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"

@@ -92,9 +92,37 @@ function validateApprovedProxyNetwork(network, options = {}) {
   }
 
   // 5. Verify Operator Approval & Server-Configured Approved Network ID
-  // Security invariant: A caller-provided boolean `isApproved: true` alone is NOT sufficient.
-  // The network MUST match an exact server-configured approved network ID.
-  const configuredApprovedId = options.approvedNetworkId || process.env.KPANEL_PROXY_NETWORK_ID;
+  // Security Invariants (Phase 4C3D2 Network Authorization Hardening):
+  // 1. Caller-supplied request bodies with `isApproved: true`, `approvedNetworkId`, or `trustedOperator: true`
+  //    are STRICTLY REJECTED as independent authorization.
+  // 2. Future execution authorization MUST derive approved network identity from trusted server-side configuration
+  //    (process.env.KPANEL_PROXY_NETWORK_ID or trustedServerConfig) or verified administrator authorization.
+  // 3. Tests / preflight harness may use injected mock values, but must label evidence synthetic.
+
+  if (options.untrustedCaller === true || options.fromRequestBody === true) {
+    if (options.isApproved || options.approvedNetworkId || options.trustedOperator) {
+      throw new StagingNetworkError(
+        'Caller-supplied approval parameters (isApproved, approvedNetworkId, trustedOperator) cannot establish authorization. Trusted server-side configuration is required.',
+        'UNTRUSTED_CALLER_AUTHORIZATION'
+      );
+    }
+  }
+
+  if (options.trustedOperator === true && !options.trustedServerContext && !options.trustedAdminSession && !options.trustedServerConfig) {
+    throw new StagingNetworkError(
+      'Arbitrary trustedOperator flag is strictly rejected. Server-side verified session required.',
+      'UNTRUSTED_OPERATOR_BYPASS'
+    );
+  }
+
+  const isServerConfigured = Boolean(
+    process.env.KPANEL_PROXY_NETWORK_ID ||
+    (options.trustedServerConfig && options.trustedServerConfig.approvedNetworkId)
+  );
+
+  const configuredApprovedId = (options.trustedServerConfig && options.trustedServerConfig.approvedNetworkId) ||
+    process.env.KPANEL_PROXY_NETWORK_ID ||
+    options.approvedNetworkId;
 
   if (!configuredApprovedId) {
     throw new StagingNetworkError(
@@ -186,6 +214,8 @@ function validateApprovedProxyNetwork(network, options = {}) {
     );
   }
 
+  const isSynthetic = !isServerConfigured || Boolean(options.synthetic || options.isSynthetic || options.offlineDryRun);
+
   return {
     valid: true,
     networkId,
@@ -193,6 +223,8 @@ function validateApprovedProxyNetwork(network, options = {}) {
     driver,
     scope,
     isApproved: true,
+    isSynthetic,
+    authorizationSource: isServerConfigured ? 'trusted-server-config' : 'synthetic-test-injection',
     traefikAttached,
     containersCount: containerEntries.length
   };

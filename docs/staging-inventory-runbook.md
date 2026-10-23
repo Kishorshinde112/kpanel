@@ -1,56 +1,53 @@
 # K-PANEL OPERATOR RUNBOOK: VPS HOST INVENTORY COLLECTION & STAGING PREFLIGHT
 
-**Phase:** 4C3D1 — Real Host Inventory Safety Review & Staging Preflight  
-**Target Environment:** Oracle Cloud Ampere A1 ARM64 (Ubuntu, 4 OCPU, 24 GB RAM)  
+**Phase:** 4C3D2 — Operator-Controlled VPS Inventory Preparation
+**Target Environment:** Oracle Cloud Ampere A1 ARM64 (Ubuntu, 4 OCPU, 24 GB RAM)
 **Security Guarantee:** STRICTLY READ-ONLY. Zero container lifecycle actions, zero network attachments, zero configuration modifications.
+**Reviewed Script Checksum (SHA-256):** `87a25ccdf8238cb703be1ad7e05b93729b0f9b2dcd13a538ba51e1a498f064f5`
 
 ---
 
-## 1. Prerequisites
+## 1. Safety & Architecture Guardrails
 
-Before running the inventory script on the Oracle VPS:
-
-1. **Host Access:** SSH access to the Oracle VPS as a user with read permissions for Docker (e.g. member of the `docker` group, or root/sudo read access).
-2. **Host Architecture:** Ubuntu Linux on ARM64 (`aarch64`).
-3. **Required Utilities:**
-   - Standard POSIX utilities: `bash` (v4+), `uname`, `hostname`, `date`, `grep`, `sed`, `awk`, `cut`, `tr`, `head`.
-   - `docker` CLI (read-only client).
-   - Optional: `timeout` (recommended for bounded command duration), `curl` (strictly loopback tests only).
-4. **Existing Workloads Status:**
-   - Existing Dokploy, n8n, Traefik, and container workloads MUST remain completely running and untouched.
-   - Do NOT stop, restart, or alter any service or firewall.
-   - Do NOT expose the Traefik dashboard or API to public interfaces.
+**Strict Operating Boundaries:**
+- The automated AI assistant is **NOT authorized to SSH into the Oracle VPS or execute commands on the production host**.
+- Only the **human operator** may run commands on the target VPS.
+- The collection script executes **exclusively read-only Docker inspection operations**.
+- **ZERO container process execution (`docker exec` is completely removed).**
+- **ZERO container creation, starting, stopping, restarting, or deletion.**
+- **ZERO Docker network creation, connection, disconnection, or modification.**
+- **ZERO writes to host configuration files or reverse-proxy directories.**
+- **ZERO public API exposure; local Traefik API probing is strictly opt-in (`--probe-api`) and disabled by default.**
+- **Do NOT modify host user groups, Docker daemon socket permissions, or firewall settings.** If Docker permissions are denied, the script safely records `permission_denied` as a blocker without modifying host security.
 
 ---
 
-## 2. Command Audit & Inventory
+## 2. Audited Command Classification
 
-The collection script (`scripts/collect-kpanel-host-inventory.sh`) executes **exclusively read-only commands** bounded by strict timeouts:
+The collection script (`scripts/collect-kpanel-host-inventory.sh`) executes exclusively read-only commands bounded by hard timeouts:
 
 | Command | Purpose | Safety Classification | Bounded Timeout |
 | :--- | :--- | :--- | :--- |
 | `hostname` | Collects host system name | Safe, read-only | Direct |
 | `uname -s, -m, -r` | OS name, architecture, kernel | Safe, read-only | Direct |
-| `date -u` | Capture timestamp (UTC) | Safe, read-only | Direct |
+| `date -u` | UTC capture timestamp | Safe, read-only | Direct |
 | `docker info` | Tests daemon access & permissions | Safe, read-only | 5 seconds |
 | `docker version` | Client & server Docker versions | Safe, read-only | 3 seconds |
 | `docker network ls -q` | Lists Docker network IDs | Safe, read-only | 5 seconds |
 | `docker network inspect <ids>` | Reads network driver, scope, internal status, and attached container names/IPs | Safe, read-only (explicit fields only) | 10 seconds |
 | `docker ps --filter "name=traefik"` | Discovers running Traefik candidate container | Safe, read-only | 5 seconds |
-| `docker inspect <traefik-id>` | Inspects `.Config.Cmd` and `.Mounts` ONLY | Safe, read-only (strictly filters out `.Config.Env`) | 3 seconds |
-| `docker exec <traefik-id> traefik version` | Retrieves Traefik binary version string | Safe, read-only | 3 seconds |
-| `curl 127.0.0.1:8080/api/rawdata` | Tests if local loopback API is accessible | Safe, read-only (loopback only, skipped if closed) | 2 seconds |
+| `docker inspect <traefik-id>` | Inspects allowlisted provider flags and bind mounts ONLY | Safe, read-only (strictly filters out `.Config.Env`) | 3 seconds |
+| `curl 127.0.0.1:<port>/api/rawdata` | Strictly opt-in via `--probe-api` (disabled by default) | Loopback only, no redirects, bounded size | 2 seconds |
 
-### Strictly Prohibited and Absent Commands
-
-The script **never** executes:
-- `docker run`, `docker start`, `docker stop`, `docker rm`
-- `docker network connect`, `docker network disconnect`, `docker network create/rm`
-- `docker system prune`, `docker compose up/down`
-- `systemctl restart`, `service restart`
-- `iptables`, `ufw`, `firewall-cmd` modifications
-- Writes to any production directory or reverse-proxy configuration
-- Dumps of `.Config.Env` or environment variables
+### Commands Prohibited and Strictly Absent
+- **ZERO `docker exec`** (no container process execution).
+- **ZERO export of raw `.Config.Cmd` or `.Config.Entrypoint` arrays.**
+- **ZERO `docker run`, `docker start`, `docker stop`, `docker rm`.**
+- **ZERO `docker network connect`, `docker network disconnect`, `docker network create/rm`.**
+- **ZERO `docker system prune`, `docker compose up/down`.**
+- **ZERO `systemctl restart`, `service restart`.**
+- **ZERO `iptables`, `ufw`, `firewall-cmd` modifications.**
+- **ZERO reads from `.env` files, TLS keys, database passwords, or session tokens.**
 
 ---
 
@@ -63,164 +60,166 @@ The script accesses **zero application secret files**:
 
 ---
 
-## 4. Execution Permissions & Restrictive File Handling
+## 4. Full Private Inventory vs. Redacted Sharing Summary
 
-The script enforces restrictive permissions:
-1. **Umask 077:** Enforced immediately at script start. Any output file created will have `0600` permissions (readable and writable only by the executing operator).
-2. **Atomic Write:** Writes to a temporary file (`<output>.tmp.$$`), sets `chmod 600`, and atomically moves it into place.
+The collection process produces two distinct outputs:
+
+1. **Private Full Inventory (`kpanel-host-inventory.json`):**
+   - Retained locally on the operator workstation.
+   - Enforces `0600` file permissions (`umask 077`).
+   - Contains exact network IDs, container IDs, and route rules necessary for offline preflight analysis.
+   - **NEVER committed to git and NEVER uploaded to external services.**
+
+2. **Redacted Review Summary (`kpanel-inventory-sanitized.json`):**
+   - Generated using the `--redact` / `--sanitize` flag.
+   - Masks private IPv4 ranges (`10.x.x.x`, `172.16-31.x.x`, `192.168.x.x`, `100.64-127.x.x`, `127.x.x.x`).
+   - Masks private IPv6 ranges (ULA `fc00::/7`, link-local `fe80::/10`, loopback `::1`).
+   - Masks system hostname (`[REDACTED-HOST]`) and internal container names.
+   - Sanitizes sensitive host filesystem paths and usernames (`/home/[REDACTED-USER]`, `/Users/[REDACTED-USER]`, `/[REDACTED-ROOT]`).
+   - Redacts potential credentials in query parameters or command flags.
+   - Explicitly notes that exact network authorization and domain ownership cannot be verified from redacted identifiers alone.
+   - Includes disclaimer: automated redaction does not guarantee zero sensitive data; operator manual review is required.
 
 ---
 
-## 5. Running the Inventory Collection on the Target VPS
+## 5. Step-by-Step Operator Execution Runbook
 
-### Step 5.1: Transfer Script to Target VPS
+Follow these exact steps to collect evidence safely:
 
-From your local operator workstation:
+### Step 1: Review the Collector Script (Workstation)
+Inspect the script content locally before transfer:
+```bash
+less scripts/collect-kpanel-host-inventory.sh
+```
+Verify that no mutating commands exist and that `docker exec` is completely absent.
+
+### Step 2: Transfer the Reviewed Script to the Oracle VPS (Workstation)
+Transfer the reviewed script securely over SSH. Do not use `curl | bash`:
 ```bash
 scp scripts/collect-kpanel-host-inventory.sh user@<oracle-vps-ip>:/home/user/
 ```
 
-### Step 5.2: Execute Collection Script
-
-On the Oracle VPS:
+### Step 3: Check Script Checksum on the VPS (Oracle VPS)
+SSH into the Oracle VPS:
 ```bash
-# Set execute permission
-chmod +x /home/user/collect-kpanel-host-inventory.sh
+ssh user@<oracle-vps-ip>
+```
+Compute the SHA-256 checksum of the transferred script:
+```bash
+sha256sum /home/user/collect-kpanel-host-inventory.sh
+```
+**Verify:** The output MUST match the reviewed checksum:
+`87a25ccdf8238cb703be1ad7e05b93729b0f9b2dcd13a538ba51e1a498f064f5`
 
-# Run collection to a restricted output file (umask 077 -> mode 0600)
+If the checksum does not match, do NOT execute the script. Re-transfer from the reviewed repository.
+
+### Step 4: Set Execute Permission (Oracle VPS)
+```bash
+chmod +x /home/user/collect-kpanel-host-inventory.sh
+```
+
+### Step 5: Run Collection & Save Private Inventory (Oracle VPS)
+Run the script as the authorized operator to collect the private full inventory:
+```bash
+# Saves private full inventory with restrictive permissions (0600 via umask 077)
 /home/user/collect-kpanel-host-inventory.sh -o /home/user/kpanel-host-inventory.json
 ```
+*Note on API Probing:* By default, no HTTP calls are made. If you have verified that Traefik exposes an internal loopback API on port 8080 and wish to probe it, you may pass `--probe-api` (e.g. `--probe-api --api-port 8080`).
 
-If you wish to produce a sanitized inventory directly on the VPS for architecture review:
+### Step 6: Produce Redacted Review Summary (Oracle VPS)
+Generate the sanitized sharing summary:
 ```bash
-/home/user/collect-kpanel-host-inventory.sh --redact -o /home/user/kpanel-host-inventory-redacted.json
+/home/user/collect-kpanel-host-inventory.sh --redact -o /home/user/kpanel-inventory-sanitized.json
+```
+Alternatively, produce both in one run:
+```bash
+/home/user/collect-kpanel-host-inventory.sh -o /home/user/kpanel-host-inventory.json --summary-output /home/user/kpanel-inventory-sanitized.json
 ```
 
----
-
-## 6. How to Inspect the Collected Inventory
-
-Before transferring or sharing the inventory, verify that the output contains no secrets:
-
+### Step 7: Examine Output for Secrets (Oracle VPS)
+Verify file permissions and inspect the outputs for any unintended sensitive data:
 ```bash
 # 1. Verify file permissions are strictly 0600
-ls -la /home/user/kpanel-host-inventory.json
+ls -la /home/user/kpanel-host-inventory.json /home/user/kpanel-inventory-sanitized.json
 # Expected: -rw------- 1 user user ...
 
 # 2. Verify valid JSON syntax
-python3 -m json.tool /home/user/kpanel-host-inventory.json > /dev/null && echo "VALID JSON"
+python3 -m json.tool /home/user/kpanel-inventory-sanitized.json > /dev/null && echo "VALID JSON"
 
-# 3. Check for any unintentional secret leaks (should return 0 matches)
-grep -inE "password|secret|token|key|private" /home/user/kpanel-host-inventory.json || echo "CLEAN: No secret keywords found"
+# 3. Check for any credentials or secret keywords
+grep -inE "password|secret|token|api_key|private" /home/user/kpanel-inventory-sanitized.json || echo "CLEAN: No secret keywords found"
 
-# 4. View Traefik provider and network summary
-jq '{traefik: .traefik, providers: .providers, networksCount: (.networks | length), routersCount: (.routers | length)}' /home/user/kpanel-host-inventory.json
+# 4. View Traefik provider and topology summary
+python3 -c "import json; data=json.load(open('/home/user/kpanel-inventory-sanitized.json')); print('Traefik:', data.get('traefik',{}).get('status')); print('Providers:', data.get('providers')); print('Networks:', len(data.get('networks',[]))); print('Routers:', len(data.get('routers',[])))"
 ```
 
----
-
-## 7. How to Sanitize Output for Architecture Review
-
-If sharing the inventory with architecture reviewers (such as ChatGPT or external reviewers), sanitize internal IP addresses and hostnames:
-
+### Step 8: Transfer Review Summary Securely to Workstation (Workstation)
+From your local operator workstation, download the sanitized review summary:
 ```bash
-# Option A: Run script with --redact flag (on VPS)
-./collect-kpanel-host-inventory.sh --redact -o kpanel-inventory-sanitized.json
-
-# Option B: Use K-Panel's offline harness with --redact (on operator workstation)
-node backend/scripts/stagingPreflightHarness.js --inventory kpanel-host-inventory.json --redact --json > kpanel-inventory-sanitized.json
+scp user@<oracle-vps-ip>:/home/user/kpanel-inventory-sanitized.json ./kpanel-inventory-sanitized.json
 ```
-
-### What Gets Redacted:
-- Hostname is replaced with `[REDACTED-HOST]`.
-- Container IPv4 addresses are masked: `172.28.0.2` → `172.28.x.x`.
-- Router domain names can be hashed or preserved based on review requirements.
-
----
-
-## 8. Secure Transfer to Local Operator Workstation
-
-Transfer the inventory file over encrypted SSH:
+If you need the private full inventory for local offline preflight testing:
 ```bash
 scp user@<oracle-vps-ip>:/home/user/kpanel-host-inventory.json ./kpanel-host-inventory.json
 ```
 
 **Git Hygiene Notice:**
-`kpanel-host-inventory.json` is automatically ignored by `.gitignore`. **NEVER commit raw or real host inventory files into version control.**
+`kpanel-host-inventory.json` and `kpanel-inventory-sanitized.json` are excluded by `.gitignore`. **NEVER commit raw or real host inventory files into version control.**
 
----
-
-## 9. Importing into K-Panel's Offline Preflight Harness
-
-On your local workstation, run the offline smoke-test preflight harness:
-
+### Step 9: Run Offline Preflight Harness (Workstation)
+On your local workstation, run K-Panel's offline smoke-test preflight harness:
 ```bash
-# Run preflight against the captured inventory for a target domain and application
 node backend/scripts/stagingPreflightHarness.js \
-  --inventory ./kpanel-host-inventory.json \
+  --inventory ./kpanel-inventory-sanitized.json \
   --domain myapp.kpanel.dev \
   --app demo-app \
   --allow-stale
 ```
+Examine the scenario classification, check results, and blockers.
 
-### Output Options:
-- **Human-Readable Summary:** Default output displays scenario classification, all 16 check results, blockers, and safety invariant confirmations.
-- **Pure JSON Output:** Pass `--json` to output machine-readable evaluation results.
-- **Sanitized Output:** Pass `--redact` to generate safe output suitable for architectural reviews.
+### Step 10: Send Sanitized Results to ChatGPT for Architecture Review
+Share the sanitized output from `kpanel-inventory-sanitized.json` and the preflight report with ChatGPT for architectural evaluation.
 
 ---
 
-## 10. Common Failure Modes & Troubleshooting
+## 6. Troubleshooting & Permission Handling
 
-| Observation | Root Cause | Operator Remedy |
+| Observation | Root Cause | Operator Guidance |
 | :--- | :--- | :--- |
-| `dockerStatus: "permission_denied"` | User executing script is not in `docker` group | Add user to group: `sudo usermod -aG docker $USER` (re-login required), or execute with `sudo`. |
-| `dockerStatus: "daemon_not_running"` | Docker daemon is stopped or socket unavailable | Inspect daemon status: `sudo systemctl status docker`. |
-| `apiStatus: "disabled_or_unreachable"` | Traefik API is not enabled on loopback port 8080 | **Expected behavior.** Dokploy Traefik keeps the API disabled by default for security. The script continues safely using Docker inspection. |
-| `FILE_PROVIDER_NOT_CONFIGURED` (Scenario B) | Traefik was started without `--providers.file` | Traefik has no File provider configured. See Section 11 for Scenario B resolution options. |
-| `FOREIGN_NETWORK_FORBIDDEN` (Scenario D) | Target proxy network belongs to Dokploy or n8n | K-Panel refuses to attach to foreign networks. A dedicated custom bridge network must be approved. |
-| `STAGING_BLOCKED_STALE_INVENTORY` | Inventory captured > 24 hours ago (or > 60s for activation) | Saved inventory cannot authorize production mutations. Recapture fresh inventory before preflight. |
+| `dockerStatus: "permission_denied"` | Operator user lacks read permissions on `/var/run/docker.sock` | **Do NOT modify daemon socket permissions or add groups without operator authorization.** If operating as non-root, execute with `sudo /home/user/collect-kpanel-host-inventory.sh ...` or report the permission blocker. |
+| `dockerStatus: "daemon_not_running"` | Docker daemon is stopped or socket unavailable | Check daemon status with `systemctl status docker`. Do NOT restart without authorization. |
+| `apiStatus: "disabled_or_skipped"` | Default execution (no `--probe-api` flag passed) | **Expected and safe default behavior.** Script relies on host-side Docker inspection. |
+| `apiStatus: "disabled_or_unreachable"` | Traefik internal API is disabled on loopback | **Expected behavior.** Dokploy Traefik keeps API disabled by default. Script continues safely. |
+| `status: "multiple-instances-detected"` | More than one Traefik container found running | The script lists all candidates. Operator must identify the authoritative container ID before proceeding. |
+| `decision: "FILE_PROVIDER_NOT_CONFIGURED"` (Scenario B) | Traefik running without dynamic File provider | Traefik lacks `--providers.file`. See Section 7 for resolution paths. |
+| `decision: "FILE_PROVIDER_MOUNT_UNKNOWN"` (Scenario B) | Traefik File provider directory is not bind-mounted to host | Dynamic route directory cannot be written from host. Host bind mount must be identified. |
+| `decision: "NO_APPROVED_PROXY_NETWORK"` (Scenario D) | No isolated bridge network matches server configuration | Target network belongs to Dokploy/n8n or is unapproved. Custom bridge network required. |
 
 ---
 
-## 11. Interpreting Readiness Decisions & Host Scenarios
-
-### Host Topology Scenarios
+## 7. Interpreting Host Integration Scenarios (A, B, C, D)
 
 - **Scenario A (`DEDICATED_FILE_PROVIDER_AVAILABLE`):**
-  - Existing Traefik supports dynamic File provider with `watch: true`.
-  - Dynamic route files can be dropped into the mapped dynamic configuration directory without restarting Traefik.
-  - Zero downtime risk to Dokploy or n8n.
-- **Scenario B (`FILE_PROVIDER_NOT_CONFIGURED`):**
-  - Traefik is running but lacks File provider arguments.
-  - Enabling File provider would require modifying Traefik startup flags and restarting the container.
-  - **Risk:** Restarting Traefik creates a service interruption for existing Dokploy and n8n workloads.
-  - **Alternative:** Evaluate whether deploying a dedicated, isolated K-Panel reverse proxy container is safer than mutating shared Traefik.
-- **Scenario C (`STAGING_UNVERIFIED`):**
+  - Existing Traefik supports dynamic File provider with `watch: true` mapped to a known host directory.
+  - Dedicated dynamic route files can be dropped into the dynamic configuration directory without restarting Traefik.
+  - Zero downtime risk to existing Dokploy or n8n workloads.
+
+- **Scenario B (`FILE_PROVIDER_NOT_CONFIGURED` or `FILE_PROVIDER_MOUNT_UNKNOWN`):**
+  - Traefik is running, but File provider is absent or dynamic directory is not mapped to host.
+  - **Risk:** Restarting Traefik to change startup args causes downtime for existing Dokploy and n8n workloads.
+  - **Alternative:** Assess whether deploying a dedicated, isolated K-Panel reverse proxy container is safer than mutating shared Dokploy Traefik.
+
+- **Scenario C (`STAGING_UNVERIFIED` / `MULTIPLE_PROXIES_DETECTED` / `TRAEFIK_NOT_FOUND`):**
   - Traefik container cannot be identified, or multiple unverified proxies are detected.
-  - Deployment is blocked. Operator must explicitly verify proxy container identity.
+  - Deployment is strictly blocked. Operator must explicitly verify proxy ownership.
+
 - **Scenario D (`NO_APPROVED_PROXY_NETWORK`):**
   - No approved isolated bridge network exists that Traefik participates in.
-  - Candidate container cannot safely join without breaking isolation or leaking ports.
-
-### Structured Readiness Decision Codes
-
-| Decision Code | Meaning | Can Deploy? |
-| :--- | :--- | :--- |
-| `STAGING_READY_FOR_AUTHORIZED_TEST` | All 16 checks passed; topology compatible, no route conflicts, network and rollback ready. | **Ready for AUTHORIZED TEST only** (requires explicit operator sign-off). |
-| `STAGING_BLOCKED_PROVIDER` | Traefik instance unidentified, provider disabled, or directory path mismatch. | **BLOCKED.** |
-| `STAGING_BLOCKED_FOREIGN_ROUTE` | Target domain or route collides with existing Dokploy, n8n, or catch-all router. | **BLOCKED.** |
-| `STAGING_BLOCKED_NETWORK` | Approved proxy network missing, unapproved, foreign, or DNS alias collision detected. | **BLOCKED.** |
-| `STAGING_BLOCKED_UNREACHABLE` | Backend service unreachable from proxy or probe failed. | **BLOCKED.** |
-| `STAGING_BLOCKED_CANDIDATE_HEALTH` | Candidate container is unhealthy, uninspected, or image digest drifted. | **BLOCKED.** |
-| `STAGING_BLOCKED_AUTHORIZATION` | Missing active worker lease, stale fencing token, or missing operator approval. | **BLOCKED.** |
-| `STAGING_BLOCKED_STALE_INVENTORY` | Inventory evidence is stale (> 24h for planning, > 60s for activation). | **BLOCKED.** |
-| `STAGING_BLOCKED_ROLLBACK` | Previous release container unhealthy or rollback target missing. | **BLOCKED.** |
-| `STAGING_UNVERIFIED` | Inventory missing, malformed, or proxy ownership unverifiable. | **BLOCKED.** |
+  - Attaching candidate container to foreign Dokploy/n8n networks is prohibited. Dedicated proxy bridge network required.
 
 ---
 
-## 12. Why a "Ready" Decision is NOT Permission to Deploy
+## 8. Why a "Ready" Decision is NOT Permission to Deploy
 
 A result of `STAGING_READY_FOR_AUTHORIZED_TEST` from the offline harness means:
 1. The evaluated topology snapshot satisfies compatibility requirements.
@@ -229,16 +228,6 @@ A result of `STAGING_READY_FOR_AUTHORIZED_TEST` from the offline harness means:
 
 **Crucial Production Safety Boundary:**
 - An offline readiness report **DOES NOT** grant permission to mutate the live Oracle VPS.
-- Saved inventory represents a historical observation (valid for architecture review up to 24h).
+- Saved inventory represents a historical snapshot (valid for architecture review up to 24h).
 - Live activation requires **fresh, verified live evidence captured immediately (≤ 60s) before any route file write**.
 - Live traffic switching requires human operator authorization established through a trusted server-side boundary, an active worker lease with an unexpired fencing token, and an atomic file write with durable rollback journal.
-
----
-
-## 13. Prerequisites for Future Live Staging Testing (Phase 4C3D2+)
-
-Live staging testing will remain blocked until:
-1. Architecture reviewer (ChatGPT) reviews the sanitized Oracle VPS inventory.
-2. The exact host dynamic configuration path is confirmed (or unresolved server paths are resolved).
-3. The exact server-configured approved network ID (`KPANEL_PROXY_NETWORK_ID`) is established in the server environment.
-4. Operator signs off on Phase 4C3D2 authorization.

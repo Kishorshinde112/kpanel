@@ -1,0 +1,149 @@
+{
+  "version": "1.2",
+  "captureTimestamp": "2026-10-23T01:00:00Z",
+  "captureSource": "operator-provided-oracle-vps-report",
+  "isSynthetic": false,
+  "isRedacted": true,
+  "hostIdentity": {
+    "hostname": "[REDACTED-HOST]",
+    "os": "Ubuntu 24.04.3 LTS",
+    "arch": "aarch64",
+    "kernel": "6.17.0-1002-oracle",
+    "dockerStatus": "available",
+    "dockerVersion": "29.1.3",
+    "buildxVersion": "v0.31.1",
+    "storageDriver": "overlay2",
+    "cgroupVersion": "2",
+    "dockerSwarmActive": true,
+    "swarm": {
+      "LocalNodeState": "active",
+      "ControlAvailable": true,
+      "Managers": 1,
+      "Nodes": 1
+    },
+    "cpuCount": 4,
+    "totalMemoryBytes": 24696061952,
+    "availableMemoryBytes": 15032385536,
+    "rootDiskTotalBytes": 155692564480,
+    "rootDiskFreeBytes": 57982058496
+  },
+  "traefik": {
+    "instanceId": "dokploy-traefik-01",
+    "containerName": "dokploy-traefik",
+    "version": "3.6.7",
+    "status": "running",
+    "instancesDetected": 1,
+    "apiStatus": "unverified",
+    "mounts": [
+      {
+        "type": "bind",
+        "source": "/etc/dokploy/traefik/dynamic",
+        "destination": "/etc/traefik/dynamic",
+        "mode": "rw",
+        "rw": true
+      }
+    ]
+  },
+  "providers": {
+    "file": {
+      "enabled": true,
+      "directory": "/etc/traefik/dynamic",
+      "watch": false,
+      "watchVerified": false,
+      "ownership": "dokploy-managed"
+    },
+    "docker": {
+      "enabled": true,
+      "network": "dokploy-network"
+    }
+  },
+  "networks": [
+    {
+      "id": "1122334455660001",
+      "name": "dokploy-network",
+      "driver": "overlay",
+      "scope": "swarm",
+      "internal": false,
+      "attachable": true,
+      "containers": [
+        {
+          "id": "dokploy-traefik-01",
+          "name": "dokploy-traefik",
+          "ipv4Address": "10.0.1.2/24"
+        },
+        {
+          "id": "dokploy-core-01",
+          "name": "dokploy-core",
+          "ipv4Address": "10.0.1.3/24"
+        }
+      ]
+    },
+    {
+      "id": "1122334455660002",
+      "name": "kpanel-clean_kpanel_net",
+      "driver": "bridge",
+      "scope": "local",
+      "internal": false,
+      "attachable": true,
+      "containers": [
+        {
+          "id": "kpanel-backend-old",
+          "name": "kpanel-backend-1",
+          "ipv4Address": "172.22.0.2/16"
+        },
+        {
+          "id": "kpanel-frontend-old",
+          "name": "kpanel-frontend-1",
+          "ipv4Address": "172.22.0.3/16"
+        }
+      ]
+    },
+    {
+      "id": "1122334455660003",
+      "name": "caddy_default",
+      "driver": "bridge",
+      "scope": "local",
+      "internal": false,
+      "attachable": false,
+      "containers": [
+        {
+          "id": "caddy-server-01",
+          "name": "caddy",
+          "ipv4Address": "172.23.0.2/16"
+        }
+      ]
+    },
+    {
+      "id": "1122334455660004",
+      "name": "n8n_net",
+      "driver": "bridge",
+      "scope": "local",
+      "internal": false,
+      "attachable": false,
+      "containers": [
+        {
+          "id": "n8n-worker-01",
+          "name": "n8n",
+          "ipv4Address": "172.24.0.2/16"
+        }
+      ]
+    }
+  ],
+  "containers": [
+    { "id": "c01", "name": "dokploy-traefik", "status": "running", "ports": [{ "hostPort": 80 }, { "hostPort": 443 }] },
+    { "id": "c02", "name": "dokploy-core", "status": "running", "ports": [] },
+    { "id": "c03", "name": "caddy", "status": "running", "ports": [{ "hostPort": 2019 }] },
+    { "id": "c04", "name": "nginx", "status": "running", "ports": [] },
+    { "id": "c05", "name": "n8n", "status": "running", "ports": [{ "hostPort": 5678 }] },
+    { "id": "c06", "name": "cloudflared", "status": "running", "ports": [] },
+    { "id": "c07", "name": "kpanel-backend-1", "status": "running", "ports": [{ "hostPort": 5001 }] },
+    { "id": "c08", "name": "kpanel-frontend-1", "status": "running", "ports": [{ "hostPort": 3030 }] }
+  ],
+  "totalContainersCount": 45,
+  "runningContainersCount": 45,
+  "hostPorts": [22, 80, 443, 2019, 3030, 5001, 5678],
+  "entryPoints": [
+    { "name": "web", "address": ":80" },
+    { "name": "websecure", "address": ":443" }
+  ]
+}

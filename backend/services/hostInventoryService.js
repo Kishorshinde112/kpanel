@@ -184,14 +184,27 @@ function ingestHostInventory(rawInput, options = {}) {
 
   const traefikRaw = rawObj.traefik || rawObj.traefikInstance || {};
   const traefikMounts = Array.isArray(traefikRaw.mounts)
-    ? traefikRaw.mounts.map((m) => ({
-        type: String(m.type || 'bind').toLowerCase(),
-        source: String(m.source || '').trim(),
-        destination: String(m.destination || '').trim(),
-        mode: String(m.mode || '').trim(),
-        rw: Boolean(m.rw)
+    ? traefikRaw.mounts.filter(Boolean).map((m) => ({
+        type: String(m.type || m.Type || 'bind').toLowerCase(),
+        source: String(m.source || m.Source || '').trim(),
+        destination: String(m.destination || m.Destination || '').trim(),
+        mode: String(m.mode || m.Mode || '').trim(),
+        rw: Boolean(m.rw !== undefined ? m.rw : m.RW)
       }))
     : [];
+
+  const detectedCandidates = Array.isArray(traefikRaw.detectedCandidates)
+    ? traefikRaw.detectedCandidates.filter(Boolean).map((c) => ({
+        id: String(c.id || '').trim().slice(0, 12),
+        name: String(c.name || '').trim(),
+        image: String(c.image || '').trim(),
+        status: String(c.status || '').trim()
+      }))
+    : [];
+
+  const rawInstancesDetected = typeof traefikRaw.instancesDetected === 'number'
+    ? traefikRaw.instancesDetected
+    : (detectedCandidates.length > 0 ? detectedCandidates.length : 1);
 
   const traefikIdentity = {
     instanceId: String(traefikRaw.instanceId || traefikRaw.instance_id || traefikRaw.containerId || '').trim() || null,
@@ -200,7 +213,8 @@ function ingestHostInventory(rawInput, options = {}) {
     configFile: String(traefikRaw.configFile || '').trim() || null,
     status: String(traefikRaw.status || '').trim() || null,
     apiStatus: String(traefikRaw.apiStatus || '').trim() || null,
-    instancesDetected: typeof traefikRaw.instancesDetected === 'number' ? traefikRaw.instancesDetected : 1,
+    instancesDetected: rawInstancesDetected,
+    detectedCandidates,
     mounts: traefikMounts
   };
 
@@ -387,11 +401,17 @@ function ingestHostInventory(rawInput, options = {}) {
   if (!traefikIdentity.instanceId) {
     missingOrUnverifiable.push('TRAEFIK_INSTANCE_ID_MISSING');
   }
+  if (traefikIdentity.instancesDetected > 1 || traefikIdentity.status === 'multiple-instances-detected') {
+    missingOrUnverifiable.push('MULTIPLE_PROXIES_DETECTED');
+  }
   if (!fileProvider.enabled && !dockerProvider.enabled) {
     missingOrUnverifiable.push('NO_ACTIVE_PROVIDERS_DETECTED');
   }
   if (fileProvider.enabled && !fileProvider.directory && !fileProvider.filename) {
     missingOrUnverifiable.push('FILE_PROVIDER_PATH_UNSPECIFIED');
+  }
+  if (fileProvider.enabled && fileProvider.directory && traefikMounts.length > 0 && !discoveredHostPath) {
+    missingOrUnverifiable.push('FILE_PROVIDER_HOST_PATH_UNSPECIFIED');
   }
   if (fileProvider.enabled && !fileProvider.watch) {
     missingOrUnverifiable.push('FILE_PROVIDER_WATCH_DISABLED');
@@ -402,6 +422,9 @@ function ingestHostInventory(rawInput, options = {}) {
   if (validatedNetworks.length === 0) {
     missingOrUnverifiable.push('DOCKER_NETWORKS_EMPTY');
   }
+
+  // Detect redacted inventory state
+  const isRedacted = Boolean(rawObj.isRedacted || rawObj.sharingSummary?.isRedacted);
 
   // Compute canonical inventory fingerprint
   const fingerprint = crypto.createHash('sha256')
@@ -432,6 +455,8 @@ function ingestHostInventory(rawInput, options = {}) {
     captureSource,
     originVerified: isTrustedProvenance,
     provenanceStatus: isTrustedProvenance ? 'verified' : 'unverified-operator-observation',
+    isRedacted,
+    networkAuthorizationStatus: rawObj.sharingSummary?.networkAuthorizationStatus || (isRedacted ? 'UNVERIFIED_NETWORK_ID_REDACTED' : 'VERIFIED_NETWORK_ID_PRESENT'),
     fingerprint,
     hostIdentity,
     traefik: traefikIdentity,
@@ -482,27 +507,94 @@ function redactInventoryForReview(inventory, options = {}) {
   const redacted = JSON.parse(JSON.stringify(inventory));
   const redactedFields = [];
 
-  // Redact hostname
+  // Helper to sanitize path strings (mask usernames in /home, /Users, and root)
+  const sanitizePath = (p) => {
+    if (!p || typeof p !== 'string') return p;
+    return p
+      .replace(/\/home\/[a-zA-Z0-9._-]+/g, '/home/[REDACTED-USER]')
+      .replace(/\/Users\/[a-zA-Z0-9._-]+/g, '/Users/[REDACTED-USER]')
+      .replace(/\/root\//g, '/[REDACTED-ROOT]/');
+  };
+
+  // Helper to sanitize private IPv4 and IPv6 addresses in any string
+  const sanitizeIpAddress = (ip) => {
+    if (!ip || typeof ip !== 'string') return ip;
+    // 10.0.0.0/8
+    let out = ip.replace(/^10\.\d+\.\d+\.\d+(\/\d+)?/, '10.x.x.x$1');
+    // 172.16.0.0/12 (172.16.x.x - 172.31.x.x)
+    out = out.replace(/^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+(\/\d+)?/, '172.$1.x.x$2');
+    // 192.168.0.0/16
+    out = out.replace(/^192\.168\.\d+\.\d+(\/\d+)?/, '192.168.x.x$1');
+    // 100.64.0.0/10 (Carrier-Grade NAT)
+    out = out.replace(/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+(\/\d+)?/, '100.$1.x.x$2');
+    // 127.0.0.0/8 (Loopback)
+    out = out.replace(/^127\.\d+\.\d+\.\d+(\/\d+)?/, '127.x.x.x$1');
+    // IPv6 ULA (fc00::/7)
+    out = out.replace(/^(fc|fd)[0-9a-f]{2}:[0-9a-f:]+/i, '[REDACTED-IPV6-ULA]');
+    // IPv6 Link-Local (fe80::/10)
+    out = out.replace(/^fe80:[0-9a-f:]+/i, '[REDACTED-IPV6-LINKLOCAL]');
+    // IPv6 Loopback (::1)
+    out = out.replace(/^::1$/, '[REDACTED-IPV6-LOOPBACK]');
+    return out;
+  };
+
+  // 1. Redact hostname
   if (redacted.hostIdentity && redacted.hostIdentity.hostname) {
     redacted.hostIdentity.hostname = '[REDACTED-HOST]';
     redactedFields.push('hostIdentity.hostname');
   }
 
-  // Redact container IPv4 addresses in networks
+  // 2. Redact Traefik mounts and path fields
+  if (redacted.traefik && Array.isArray(redacted.traefik.mounts)) {
+    for (const m of redacted.traefik.mounts) {
+      if (m.source) m.source = sanitizePath(m.source);
+      if (m.destination) m.destination = sanitizePath(m.destination);
+    }
+    redactedFields.push('traefik.mounts[].source');
+  }
+
+  if (redacted.providers?.file) {
+    if (redacted.providers.file.hostPath) {
+      redacted.providers.file.hostPath = sanitizePath(redacted.providers.file.hostPath);
+      redactedFields.push('providers.file.hostPath');
+    }
+    if (redacted.providers.file.directory) {
+      redacted.providers.file.directory = sanitizePath(redacted.providers.file.directory);
+      redactedFields.push('providers.file.directory');
+    }
+  }
+
+  // 3. Redact container IPv4/IPv6 addresses and internal container names in networks
   if (Array.isArray(redacted.networks)) {
+    let containerIndex = 1;
     for (const net of redacted.networks) {
       if (Array.isArray(net.containers)) {
         for (const c of net.containers) {
           if (c.ipv4Address) {
-            c.ipv4Address = c.ipv4Address.replace(/^(\d+\.\d+)\.\d+\.\d+/, '$1.x.x');
+            c.ipv4Address = sanitizeIpAddress(c.ipv4Address);
+          }
+          if (options.redactContainerNames === true && c.name) {
+            c.name = `[REDACTED-CONTAINER-${containerIndex++}]`;
           }
         }
       }
+
+      // Optionally redact network IDs if requested or full review mode
+      if (options.redactNetworkIds === true && net.id) {
+        const netHash = crypto.createHash('sha256').update(net.id).digest('hex').slice(0, 8);
+        net.id = `[REDACTED-NET-${netHash}]`;
+      }
     }
     redactedFields.push('networks[].containers[].ipv4Address');
+    if (options.redactContainerNames === true) {
+      redactedFields.push('networks[].containers[].name');
+    }
+    if (options.redactNetworkIds === true) {
+      redactedFields.push('networks[].id');
+    }
   }
 
-  // Redact confidential domain names if requested
+  // 4. Redact confidential domain names if requested
   if (options.redactDomains === true && Array.isArray(redacted.routers)) {
     for (const r of redacted.routers) {
       if (r.rule) {
@@ -515,14 +607,33 @@ function redactInventoryForReview(inventory, options = {}) {
     redactedFields.push('routers[].rule.domains');
   }
 
+  // 5. Sanitize credentials in string fields
+  const sanitizeStringCreds = (str) => {
+    if (!str || typeof str !== 'string') return str;
+    return str.replace(/(password|secret|token|api_key|apikey)=[^ "&,\\]+/gi, '$1=[REDACTED]');
+  };
+
+  if (Array.isArray(redacted.routers)) {
+    for (const r of redacted.routers) {
+      if (r.rule) r.rule = sanitizeStringCreds(r.rule);
+    }
+  }
+
   redacted.isRedacted = true;
   redacted.redactedAt = new Date().toISOString();
   redacted.redactedFields = redactedFields;
+  redacted.networkAuthorizationStatus = options.redactNetworkIds
+    ? 'UNVERIFIED_NETWORK_ID_REDACTED'
+    : (redacted.networkAuthorizationStatus || 'VERIFIED_NETWORK_ID_PRESENT');
   redacted.sharingGuidance = {
-    safetySummary: 'Internal hostnames and container IPs have been masked. Suitable for architecture review.',
+    safetySummary: 'Internal hostnames, private IPv4/IPv6 addresses, and usernames in paths have been masked. Suitable for architecture review.',
     routingLimitation: options.redactDomains
-      ? 'Domain names were masked; offline domain collision detection requires unredacted domain names or matching hashed tokens.'
-      : 'Domain names preserved for accurate routing conflict analysis.'
+      ? 'Domain names were masked; domain ownership and collision detection cannot be verified with masked domains.'
+      : 'Domain names preserved for accurate routing conflict analysis.',
+    networkLimitation: options.redactNetworkIds
+      ? 'Network IDs were redacted; exact network authorization must be verified against private full inventory.'
+      : 'Network IDs preserved for authorization verification.',
+    sharingDisclaimer: 'Automated redaction sanitizes known private IP ranges, hostnames, usernames in paths, and container identifiers, but cannot guarantee zero sensitive data. Operator manual inspection is required before external distribution.'
   };
 
   return redacted;
@@ -530,10 +641,10 @@ function redactInventoryForReview(inventory, options = {}) {
 
 /**
  * Classifies host integration topology into defined scenarios (A, B, C, D)
- * as required by the Phase 4C3D1 architecture review.
+ * as required by the Phase 4C3D1/4C3D2 architecture review.
  *
  * @param {Object} inventory - Validated host inventory
- * @param {Object} [options] - Options ({ approvedNetworkId })
+ * @param {Object} [options] - Options ({ approvedNetworkId, trustedServerConfig })
  * @returns {Object} Scenario classification report
  */
 function classifyHostIntegrationScenario(inventory, options = {}) {
@@ -552,6 +663,22 @@ function classifyHostIntegrationScenario(inventory, options = {}) {
   const fileProvider = providers.file || {};
   const networks = inventory.networks || [];
 
+  // Scenario C: Multiple Traefik instances detected
+  if (traefik.instancesDetected > 1 || traefik.status === 'multiple-instances-detected') {
+    return {
+      scenario: 'SCENARIO_C',
+      status: 'STAGING_UNVERIFIED',
+      decision: 'MULTIPLE_PROXIES_DETECTED',
+      description: `Multiple Traefik proxy instances (${traefik.instancesDetected}) detected on host. Unresolved proxy ownership cannot authorize routing.`,
+      risks: [
+        'Routing candidate container through an unintended Traefik instance breaks expected isolation and traffic switching guarantees.',
+        'Misidentifying the primary proxy container risks routing collision with production workloads.'
+      ],
+      recommendation: 'Operator must identify the authoritative proxy container ID and verify single-proxy ownership.',
+      requiresOperatorAction: true
+    };
+  }
+
   // Scenario C: Traefik instance or proxy ownership cannot be verified
   if (!traefik.instanceId || traefik.status === 'not-found') {
     return {
@@ -565,7 +692,7 @@ function classifyHostIntegrationScenario(inventory, options = {}) {
     };
   }
 
-  // Scenario B: Existing Traefik has no File provider
+  // Scenario B: Existing Traefik has no File provider (File provider verified absent)
   if (!fileProvider.enabled) {
     return {
       scenario: 'SCENARIO_B',
@@ -586,8 +713,47 @@ function classifyHostIntegrationScenario(inventory, options = {}) {
     };
   }
 
+  // Scenario B: File provider enabled but directory/file path unknown
+  if (fileProvider.enabled && !fileProvider.directory && !fileProvider.filename) {
+    return {
+      scenario: 'SCENARIO_B',
+      status: 'BLOCKED_PROVIDER',
+      decision: 'FILE_PROVIDER_CONFIG_UNKNOWN',
+      description: 'Traefik has dynamic File provider enabled, but dynamic directory or file configuration could not be determined.',
+      risks: [
+        'Target route configuration path is unknown; writing files to arbitrary directories will fail to load in Traefik.'
+      ],
+      alternatives: [
+        'Operator must verify Traefik container command arguments for --providers.file.directory.'
+      ],
+      recommendation: 'Operator must configure or verify Traefik dynamic configuration directory path.',
+      requiresOperatorAction: true
+    };
+  }
+
+  // Scenario B: File provider directory configured but host mount unknown
+  if (fileProvider.enabled && fileProvider.directory && !fileProvider.hostPath) {
+    return {
+      scenario: 'SCENARIO_B',
+      status: 'BLOCKED_PROVIDER',
+      decision: 'FILE_PROVIDER_MOUNT_UNKNOWN',
+      description: `Traefik File provider directory "${fileProvider.directory}" has no identified host bind mount. Host route file writes cannot reach container.`,
+      risks: [
+        'Writing dynamic route files to an unmapped host directory will not propagate to the running Traefik instance.'
+      ],
+      alternatives: [
+        'Operator must identify host directory bind-mounted to Traefik dynamic configuration directory.'
+      ],
+      recommendation: 'Operator must map host dynamic directory to Traefik dynamic configuration directory.',
+      requiresOperatorAction: true
+    };
+  }
+
   // Scenario D: Candidate cannot safely join existing proxy network
-  const approvedNetId = options.approvedNetworkId || process.env.KPANEL_PROXY_NETWORK_ID;
+  const approvedNetId = options.approvedNetworkId ||
+    (options.trustedServerConfig && options.trustedServerConfig.approvedNetworkId) ||
+    process.env.KPANEL_PROXY_NETWORK_ID;
+
   const candidateBridgeNet = networks.find((n) =>
     (approvedNetId && (n.id === approvedNetId || n.name === approvedNetId)) ||
     (n.containers && n.containers.some((c) => c.name.includes('traefik')) && n.driver === 'bridge' && !n.name.includes('dokploy') && !n.name.includes('n8n'))
