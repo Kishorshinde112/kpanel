@@ -1,0 +1,59 @@
+# K-Panel Production Docker Compose Override
+# Ensures persistent data and environment files resolve to exact canonical paths
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+services:
+  backend:
+    container_name: kpanel-backend-1
+    restart: always
+    volumes:
+      # Docker engine socket for container inspection and operations
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Canonical persistent data directory (SQLite db, legacy deployments.json, logs)
+      - ${KPANEL_DATA_DIR:-/home/ubuntu/kpanel-clean/backend/data}:/app/data
+      # Canonical environment file mounted read-only to prevent accidental modification
+      - ${KPANEL_ENV_FILE:-/home/ubuntu/kpanel-clean/backend/.env}:/app/.env:ro
+      # Broad host mount preserved for compatibility with existing path resolutions
+      - /home/ubuntu:/home/ubuntu
+    environment:
+      - PORT=5001
+      - NODE_ENV=production
+    ports:
+      # Bound strictly to loopback interface - zero public exposure
+      - "127.0.0.1:5001:5001"
+    networks:
+      - kpanel_net
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.kpanel-api.rule=Host(`kpanel.kishorlab.dev`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.kpanel-api.priority=20"
+      - "traefik.http.routers.kpanel-api.entrypoints=websecure"
+      - "traefik.http.routers.kpanel-api.tls=true"
+      - "traefik.http.services.kpanel-api.loadbalancer.server.port=5001"
+
+  frontend:
+    container_name: kpanel-frontend-1
+    restart: always
+    environment:
+      - BACKEND_URL=http://backend:5001
+      - NODE_ENV=production
+    ports:
+      # Bound strictly to loopback interface - zero public exposure
+      - "127.0.0.1:3030:3000"
+    networks:
+      - kpanel_net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.kpanel-frontend.rule=Host(`kpanel.kishorlab.dev`) && PathPrefix(`/`)"
+      - "traefik.http.routers.kpanel-frontend.priority=10"
+      - "traefik.http.routers.kpanel-frontend.entrypoints=websecure"
+      - "traefik.http.routers.kpanel-frontend.tls=true"
+      - "traefik.http.services.kpanel-frontend.loadbalancer.server.port=3000"
+
+networks:
+  kpanel_net:
+    driver: bridge
+  dokploy-network:
+    external: true

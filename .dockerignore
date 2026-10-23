@@ -1,0 +1,86 @@
+# Secrets, keys, and environment files
+.env
+.env*
+*.env
+*.env.*
+**/.env
+**/.env*
+
+# Persistent runtime data and SQLite databases
+backend/data/
+**/data/*.db*
+**/data/*.log*
+*.db
+*.db-*
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# Application logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Node dependencies
+node_modules/
+**/node_modules/
+
+# Next.js build cache
+.next/
+**/frontend/.next/
+
+# SSH keys, private keys, and TLS certificates
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+*.pem
+*.key
+*.pkcs12
+*.pfx
+*.p12
+*.crt
+*.cer
+*.pub
+known_hosts
+authorized_keys
+
+# Token and credential storage files
+credentials.json
+*.credential
+*.credentials
+*token*.json
+*secret*.json
+*secret*.txt
+*secret*.key
+secrets/
+credentials/
+
+# Backups and archives
+backups/
+*.bak
+*.backup
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+# Repository metadata
+.git
+.gitignore
+.github
+
+# Temporary, OS, and editor files
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+.vscode/
+.idea/
+.claude/

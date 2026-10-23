@@ -5,9 +5,8 @@ services:
     restart: always
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./backend/data:/app/data
-      - ./backend/server.js:/app/server.js
-      - ./backend/.env:/app/.env
+      - ${KPANEL_DATA_DIR:-./backend/data}:/app/data
+      - ${KPANEL_ENV_FILE:-./backend/.env}:/app/.env
       - /home/ubuntu:/home/ubuntu
     environment:
       - PORT=5001
